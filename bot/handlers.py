@@ -26,7 +26,14 @@ from bot.llm import Image, LLMError
 from bot.pipeline import (
     ASKED_QUESTIONS,
     BACKGROUND,
+    ATTEMPT_EDIT,
+    ATTEMPT_REDRAW,
     BACKGROUND_ACCEPTED,
+    BACKGROUND_ALT,
+    BACKGROUND_ALT_FIELDS,
+    BACKGROUND_ATTEMPT,
+    BACKGROUND_CHOICE,
+    BACKGROUND_COMMENT,
     BACKGROUND_FIELDS,
     DATA,
     DESCRIPTION,
@@ -34,6 +41,7 @@ from bot.pipeline import (
     MAX_SLIDES,
     PLAN,
     RATIO_ANSWER_KEY,
+    RESEARCH_ANSWER_KEY,
     SKIPPED_ANSWER,
     SOURCES,
     SOURCES_NOTE,
@@ -45,10 +53,15 @@ from bot.pipeline import (
     BackgroundFields,
     Pipeline,
     parse_aspect_ratio,
+    search_declined,
     slide_kind,
+    plan_slide_numbers,
+    slide_marked_kind,
     slide_prompt_kind,
     split_descriptions,
     text_check_kind,
+    user_image_failed_kind,
+    user_image_kind,
 )
 from bot.sources import (
     BINARY_TYPES,
@@ -62,6 +75,7 @@ from bot.sources import (
 )
 from bot.questions import Question, QuestionBank, Survey
 from bot.textcheck import TextIssue
+from bot.user_images import MAX_CAPTION_CHARS, UserImage, find_area, marker_color, place_image
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -83,8 +97,12 @@ SKIP_QUESTION_PREFIX = "skip_question:"  # + question key: «Пропустит�
 EDIT_QUESTION_PREFIX = "edit_question:"  # + question key: re-ask this question from the summary
 STYLE_REF_SKIP = "style_ref_skip"
 WAIT_STYLE_REF = "style_ref"  # sessions.waiting_for while the bot waits for a reference image
-BACKGROUND_ACCEPT = "background_accept"
-BACKGROUND_REGENERATE = "background_regenerate"
+BACKGROUND_ACCEPT = "background_accept"  # accept the first background
+BACKGROUND_EDIT = "background_edit"
+# Same value as the old «Перегенерировать» button, so buttons sent before the update still work.
+BACKGROUND_REDRAW = "background_regenerate"
+BACKGROUND_PICK_PREFIX = "background_pick:"  # + "1" or "2": the background chosen after the change
+WAIT_BACKGROUND_COMMENT = "background_comment"  # sessions.waiting_for while the bot waits for the comment
 MAX_IMAGE_BYTES = 10_000_000
 # Slide requests running at the same time. 1 = one by one: the Vertex trial quota
 # answered 429 to 3 parallel requests, and retries only slowed things down.
@@ -179,14 +197,59 @@ style_ref_keyboard = InlineKeyboardMarkup(
 )
 background_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
+        [InlineKeyboardButton(text="Принять", callback_data=BACKGROUND_ACCEPT)],
         [
-            InlineKeyboardButton(text="Принять", callback_data=BACKGROUND_ACCEPT),
-            InlineKeyboardButton(text="Перегенерировать", callback_data=BACKGROUND_REGENERATE),
+            InlineKeyboardButton(text="Доработать", callback_data=BACKGROUND_EDIT),
+            InlineKeyboardButton(text="Нарисовать заново", callback_data=BACKGROUND_REDRAW),
+        ],
+    ]
+)
+background_choice_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Вариант 1", callback_data=f"{BACKGROUND_PICK_PREFIX}1"),
+            InlineKeyboardButton(text="Вариант 2", callback_data=f"{BACKGROUND_PICK_PREFIX}2"),
         ]
     ]
 )
+# The second background failed: try again, or keep the first one.
+background_retry_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Повторить", callback_data=RETRY_STEP),
+            InlineKeyboardButton(text="Принять первый фон", callback_data=BACKGROUND_ACCEPT),
+        ]
+    ]
+)
+BACKGROUND_CAPTION = (
+    "Фон для слайдов. Если нравится — «Принять». Чтобы поправить детали — «Доработать», "
+    "чтобы получить совсем другой вариант — «Нарисовать заново». Изменить фон можно один раз."
+)
+BACKGROUND_COMMENT_REQUEST = "В свободной форме укажите, что в фоне понравилось и что не понравилось."
+
+# Where the background of a session stands (see background_stage).
+BG_OFFERED = "offered"  # the first background waits for «Принять» / «Доработать» / «Нарисовать заново»
+BG_COMMENT = "comment"  # «Доработать» pressed, waiting for the comment
+BG_PENDING = "pending"  # the second background is being drawn, or drawing it failed
+BG_CHOICE = "choice"  # both backgrounds shown, waiting for «Вариант 1» / «Вариант 2»
+BG_ACCEPTED = "accepted"
+# The user's own pictures for slides, collected after the plan is accepted:
+WAIT_SLIDE_IMAGES = "slide_images"  # sessions.waiting_for while the slide buttons are shown
+WAIT_SLIDE_PHOTO_PREFIX = "slide_photo:"  # + N: waiting for the photo for slide N
+WAIT_CAPTION_PREFIX = "photo_caption:"  # + N: waiting for the caption of slide N's photo
+SLIDE_IMAGE_PREFIX = "slide_image:"  # + N: the «Слайд N» button
+SLIDE_IMAGES_DONE = "slide_images_done"  # callback, and the artifact kind that marks the step as done
+CAPTION_SKIP = "caption_skip"
+SLIDE_IMAGES_REQUEST = (
+    "План принят. Если хотите вставить свои изображения на слайды, нажмите номер слайда и пришлите фото — "
+    "по одному на слайд. Изображение будет вставлено без изменений."
+)
+caption_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="Продолжить без подписи", callback_data=CAPTION_SKIP)]]
+)
+
 STYLE_REF_REQUEST = (
-    "План принят. Теперь дизайн слайдов.\n\n"
+    "Теперь дизайн слайдов.\n\n"
     "Если у вас есть картинка, стиль которой нравится (фото, скриншот, слайд из другой презентации), "
     "пришлите её одним изображением — фон сделаю в похожем стиле. Если нет — нажмите «Пропустить»."
 )
@@ -500,9 +563,14 @@ async def run_pipeline(
             await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
             if step is DATA and await db.get_artifact(session_id, SOURCES) is None:
-                await message.answer("Ищу информацию в открытых источниках…")
-                tz = await db.get_artifact(session_id, TZ.kind)
-                await db.save_artifact(session_id, SOURCES, await pipeline.find_sources(tz))
+                if search_declined(answers.get(RESEARCH_ANSWER_KEY)):
+                    # Empty sources: step 02 is told there is no internet access.
+                    log.info("Web search skipped for session %d: the user said it is not needed", session_id)
+                    await db.save_artifact(session_id, SOURCES, "")
+                else:
+                    await message.answer("Ищу информацию в открытых источниках…")
+                    tz = await db.get_artifact(session_id, TZ.kind)
+                    await db.save_artifact(session_id, SOURCES, await pipeline.find_sources(tz))
 
             artifacts = await db.get_artifacts(session_id)
             try:
@@ -522,6 +590,77 @@ async def run_pipeline(
         await show_plan(message, await db.get_artifact(session_id, PLAN.kind))
     finally:
         _running.discard(session_id)
+
+
+def slide_images_keyboard(numbers: list[int], with_image: set[int]) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=f"✓ Слайд {n}" if n in with_image else f"Слайд {n}", callback_data=f"{SLIDE_IMAGE_PREFIX}{n}"
+        )
+        for n in numbers
+    ]
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    done = "Готово" if with_image else "Продолжить без фото"
+    rows.append([InlineKeyboardButton(text=done, callback_data=SLIDE_IMAGES_DONE)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def load_user_images(db: Database, session_id: int) -> dict[int, UserImage]:
+    """The user's pictures by slide number."""
+    artifacts = await db.get_artifacts(session_id)
+    images = {}
+    for number in range(1, MAX_SLIDES + 1):
+        if user_image_kind(number) in artifacts:
+            images[number] = UserImage.from_json(artifacts[user_image_kind(number)])
+    return images
+
+
+async def show_slide_images(message: Message, db: Database, session_id: int, text: str) -> None:
+    """The «Слайд N» buttons; a plan without «СЛАЙД N» lines goes straight to the style reference."""
+    numbers = plan_slide_numbers(await db.get_artifact(session_id, PLAN.kind) or "")[:MAX_SLIDES]
+    if not numbers:
+        await finish_slide_images(message, db, session_id)
+        return
+    await db.set_waiting_for(session_id, WAIT_SLIDE_IMAGES)
+    with_image = set(await load_user_images(db, session_id))
+    await message.answer(text, reply_markup=slide_images_keyboard(numbers, with_image))
+
+
+async def finish_slide_images(message: Message, db: Database, session_id: int) -> None:
+    await db.save_artifact(session_id, SLIDE_IMAGES_DONE, "", model="user")
+    await db.set_waiting_for(session_id, WAIT_STYLE_REF)
+    await message.answer(STYLE_REF_REQUEST, reply_markup=style_ref_keyboard)
+
+
+def waiting_number(waiting_for: str | None, prefix: str) -> int | None:
+    """N from a waiting_for value like "slide_photo:N", or None if it has another prefix."""
+    if waiting_for and waiting_for.startswith(prefix):
+        return int(waiting_for.removeprefix(prefix))
+    return None
+
+
+def in_slide_images_step(waiting_for: str | None) -> bool:
+    return waiting_for == WAIT_SLIDE_IMAGES or (
+        waiting_for is not None and waiting_for.startswith((WAIT_SLIDE_PHOTO_PREFIX, WAIT_CAPTION_PREFIX))
+    )
+
+
+async def receive_slide_photo(message: Message, db: Database, files_dir: Path, session_id: int, number: int) -> None:
+    """Save the photo for slide N (its Telegram caption is ignored) and ask for a caption."""
+    photo = message.photo[-1]  # Telegram sends several sizes; the last one is the largest
+    if (photo.file_size or 0) > MAX_IMAGE_BYTES:
+        await message.answer("Фото слишком большое (больше 10 МБ). Пришлите поменьше.")
+        return
+    data = (await message.bot.download(photo)).read()
+    path = save_image(files_dir, session_id, f"Фото_слайд_{number:02d}", Image(data, "image/jpeg"))
+    image = UserImage(str(path), photo.width, photo.height)
+    await db.save_artifact(session_id, user_image_kind(number), image.to_json(), model="user")
+    await db.set_waiting_for(session_id, f"{WAIT_CAPTION_PREFIX}{number}")
+    await message.answer(
+        f"Фото для слайда {number} получено. Если хотите добавить подпись, пришлите её следующим сообщением "
+        f"(до {MAX_CAPTION_CHARS} символов).",
+        reply_markup=caption_keyboard,
+    )
 
 
 async def show_plan(message: Message, plan: str) -> None:
@@ -544,7 +683,9 @@ async def session_with_plan(callback: CallbackQuery, db: Database) -> int | None
         session_id is None
         or await db.get_artifact(session_id, PLAN.kind) is None
         or await db.get_artifact(session_id, STYLE_REF) is not None  # plan already accepted
+        or await db.get_artifact(session_id, SLIDE_IMAGES_DONE) is not None  # plan already accepted
         or await db.get_waiting_for(session_id) == WAIT_STYLE_REF
+        or in_slide_images_step(await db.get_waiting_for(session_id))
     ):
         await callback.message.answer("Этот план уже неактуален.", reply_markup=start_keyboard)
         return None
@@ -609,12 +750,8 @@ async def receive_style_ref(
 
 
 async def run_design(message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int) -> None:
-    """Generate a background (prompt 04) and show it with «Принять» / «Перегенерировать».
-
-    Always draws a new image, so it serves both the first attempt and regeneration.
-    The prompt fields are filled from the ТЗ once and reused, so a regenerated
-    background is a variation of the same idea, not a different design.
-    """
+    """Generate the first background (prompt 04) and show it with «Принять» / «Доработать» /
+    «Нарисовать заново». The prompt fields are filled from the ТЗ once and reused on retry."""
     if session_id in _running:
         await message.answer("Работа уже идёт, подождите немного.")
         return
@@ -642,11 +779,92 @@ async def run_design(message: Message, db: Database, pipeline: Pipeline, files_d
         await db.save_artifact(session_id, BACKGROUND, str(path), model)
         await message.answer_photo(
             BufferedInputFile(image.data, filename=path.name),
-            caption="Фон для слайдов. Если нравится — «Принять», если нет — «Перегенерировать».",
+            caption=BACKGROUND_CAPTION,
             reply_markup=background_keyboard,
         )
     finally:
         _running.discard(session_id)
+
+
+def background_stage(artifacts: dict[str, str], waiting_for: str | None) -> str | None:
+    """Where the session's background stands; None if there is no background yet."""
+    if BACKGROUND not in artifacts:
+        return None
+    if BACKGROUND_ACCEPTED in artifacts:
+        return BG_ACCEPTED
+    if BACKGROUND_ALT in artifacts:
+        return BG_CHOICE
+    if waiting_for == WAIT_BACKGROUND_COMMENT:
+        return BG_COMMENT
+    if BACKGROUND_ATTEMPT in artifacts:
+        return BG_PENDING
+    return BG_OFFERED
+
+
+def chosen_background(artifacts: dict[str, str]) -> str:
+    """Path to the background the slides are drawn on."""
+    return artifacts[BACKGROUND_ALT] if artifacts.get(BACKGROUND_CHOICE) == "2" else artifacts[BACKGROUND]
+
+
+async def run_background_change(
+    message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int
+) -> None:
+    """The one change of the background: fix the first one by the user's comment («Доработать»)
+    or draw a different one («Нарисовать заново»); then show both to choose from.
+
+    «Нарисовать заново» without a reference picks new colors and style too; with a reference
+    the style stays the reference's, and only the composition and elements change.
+    """
+    if session_id in _running:
+        await message.answer("Работа уже идёт, подождите немного.")
+        return
+    _running.add(session_id)
+    try:
+        artifacts = await db.get_artifacts(session_id)
+        attempt = artifacts[BACKGROUND_ATTEMPT]
+        ratio = await session_ratio(db, session_id)
+        first = load_image(artifacts[BACKGROUND])
+        if attempt == ATTEMPT_EDIT:
+            await message.answer("Дорабатываю фон. Это может занять до минуты…")
+        else:
+            await message.answer("Рисую новый фон. Это может занять до минуты…")
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+        try:
+            if attempt == ATTEMPT_EDIT:
+                image, model = await pipeline.edit_background(first, artifacts[BACKGROUND_COMMENT], ratio)
+            else:
+                reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
+                fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
+                if reference is None:
+                    if BACKGROUND_ALT_FIELDS in artifacts:
+                        fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_ALT_FIELDS])
+                    else:
+                        fields = await pipeline.background_fields(artifacts[TZ.kind], False, previous=fields)
+                        await db.save_artifact(session_id, BACKGROUND_ALT_FIELDS, fields.model_dump_json())
+                image, model = await pipeline.background(fields, ratio, reference, previous=first)
+        except LLMError as e:
+            log.error("Background change (%s) failed for session %d: %s", attempt, session_id, e)
+            await message.answer(
+                "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз или примите первый фон.",
+                reply_markup=background_retry_keyboard,
+            )
+            return
+        path = save_image(files_dir, session_id, "Фон_2", image)
+        await db.save_artifact(session_id, BACKGROUND_ALT, str(path), model)
+        await show_background_choice(message, first, image, attempt)
+    finally:
+        _running.discard(session_id)
+
+
+async def show_background_choice(message: Message, first: Image, second: Image, attempt: str) -> None:
+    second_title = "доработанный" if attempt == ATTEMPT_EDIT else "нарисованный заново"
+    await message.answer_media_group(
+        [
+            InputMediaPhoto(media=BufferedInputFile(first.data, "Фон_1.png"), caption="Вариант 1 — исходный"),
+            InputMediaPhoto(media=BufferedInputFile(second.data, "Фон_2.png"), caption=f"Вариант 2 — {second_title}"),
+        ]
+    )
+    await message.answer("Какой фон берём для слайдов?", reply_markup=background_choice_keyboard)
 
 
 async def run_slides(
@@ -665,7 +883,7 @@ async def run_slides(
     try:
         artifacts = await db.get_artifacts(session_id)
         ratio = await session_ratio(db, session_id)
-        background = load_image(artifacts[BACKGROUND])
+        background = load_image(chosen_background(artifacts))
         try:
             if STYLE not in artifacts:
                 await message.answer("Готовлю стиль оформления слайдов…")
@@ -676,7 +894,8 @@ async def run_slides(
             if DESCRIPTIONS not in artifacts:
                 await message.answer("Продумываю, как показать содержимое каждого слайда…")
                 await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-                descriptions, model = await pipeline.descriptions(artifacts[PLAN.kind])
+                images = await load_user_images(db, session_id)
+                descriptions, model = await pipeline.descriptions(artifacts[PLAN.kind], images)
                 await db.save_artifact(session_id, DESCRIPTIONS, descriptions, model)
                 artifacts[DESCRIPTIONS] = descriptions
         except LLMError as e:
@@ -709,10 +928,26 @@ async def run_slides(
         paths = [Path(artifacts[slide_kind(n)]) for n in blocks]
         await send_slides(message, paths)
         await db.finish_session(session_id)
+        no_picture = [str(n) for n in blocks if user_image_failed_kind(n) in artifacts]
+        if no_picture:
+            report += (
+                "\n\nНе удалось вставить ваши изображения на слайды: " + ", ".join(no_picture) + ". "
+                "Эти слайды нарисованы без них."
+            )
         await message.answer(report)
         await message.answer("Презентация готова!", reply_markup=start_keyboard)
     finally:
         _running.discard(session_id)
+
+
+def sample_slide(blocks: dict[int, str], with_picture: set[int] = frozenset()) -> int | None:
+    """Slide whose design the others copy: the second one, as slide 1 is the title slide
+    (prompt 03-1) and its large centered heading doesn't fit content slides. A slide with the
+    user's picture is skipped, or the model would draw similar pictures on the others;
+    None if every slide has one."""
+    numbers = list(blocks)
+    candidates = [n for n in numbers[1:] + numbers[:1] if n not in with_picture]
+    return candidates[0] if candidates else None
 
 
 async def draw_slides(
@@ -727,8 +962,8 @@ async def draw_slides(
 ) -> list[int]:
     """Draw the slides that have no saved image yet. Returns the numbers that failed.
 
-    The first slide is drawn alone and then attached to the others as a design sample;
-    the others follow, SLIDE_CONCURRENCY at a time.
+    The sample slide (see sample_slide) is drawn alone and then attached to the others as
+    a design sample; the others follow, SLIDE_CONCURRENCY at a time.
     """
     artifacts = await db.get_artifacts(session_id)
     style = artifacts[STYLE]
@@ -740,32 +975,69 @@ async def draw_slides(
     await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
     failed: list[int] = []
 
-    async def draw(number: int, sample: Image | None) -> Image | None:
-        nonlocal done
-        prompt = pipeline.slide_prompt(number, blocks[number], style, ratio, with_sample=sample is not None)
+    images = await load_user_images(db, session_id)
+    marker = marker_color(style)
+
+    async def render(number: int, sample: Image | None, picture: UserImage | None, area: bool) -> tuple[Image, str]:
+        prompt = pipeline.slide_prompt(
+            number,
+            blocks[number],
+            style,
+            ratio,
+            with_sample=sample is not None,
+            image=picture,
+            marker=marker if area else None,
+        )
         # Saved before the request: if the slide comes out wrong, the prompt shows where the problem came from.
         await db.save_artifact(session_id, slide_prompt_kind(number), prompt)
+        return await pipeline.slide(prompt, ratio, background, sample)
+
+    async def draw_with_picture(number: int, sample: Image | None, picture: UserImage) -> tuple[Path, Image, str]:
+        """The model leaves a marker-colored area, the picture is pasted into it. Two tries;
+        if the area doesn't come out, the slide is drawn without it."""
+        for attempt in (1, 2):
+            image, model = await render(number, sample, picture, area=True)
+            box = await asyncio.to_thread(find_area, image.data, marker)
+            if box is not None:
+                marked = save_image(files_dir, session_id, f"Слайд_{number:02d}_разметка", image)
+                await db.save_artifact(session_id, slide_marked_kind(number), str(marked), model)
+                picture_data = Path(picture.path).read_bytes()
+                data = await asyncio.to_thread(place_image, image.data, box, picture_data, style)
+                final = Image(data, "image/jpeg")
+                return save_image(files_dir, session_id, f"Слайд_{number:02d}", final), final, model
+            log.warning("No area for the user's picture: session %d, slide %d, try %d", session_id, number, attempt)
+        image, model = await render(number, sample, picture, area=False)
+        await db.save_artifact(session_id, user_image_failed_kind(number), "")
+        return save_image(files_dir, session_id, f"Слайд_{number:02d}", image), image, model
+
+    async def draw(number: int, sample: Image | None) -> Image | None:
+        nonlocal done
         try:
-            image, model = await pipeline.slide(prompt, ratio, background, sample)
+            if number in images:
+                path, image, model = await draw_with_picture(number, sample, images[number])
+            else:
+                image, model = await render(number, sample, None, area=False)
+                path = save_image(files_dir, session_id, f"Слайд_{number:02d}", image)
         except LLMError as e:
             log.error("Slide %d failed for session %d: %s", number, session_id, e)
             failed.append(number)
             return None
-        path = save_image(files_dir, session_id, f"Слайд_{number:02d}", image)
         await db.save_artifact(session_id, slide_kind(number), str(path), model)
         done += 1
         with suppress(TelegramBadRequest):  # e.g. "message is not modified"
             await status.edit_text(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
         return image
 
-    first = next(iter(blocks))
-    if first in missing:
-        sample = await draw(first, None)
+    sample_number = sample_slide(blocks, set(images))
+    if sample_number is None:
+        sample = None
+    elif sample_number in missing:
+        sample = await draw(sample_number, None)
         if sample is None:
             return failed  # without the sample the others would look different: stop here
-        missing.remove(first)
+        missing.remove(sample_number)
     else:
-        sample = load_image(artifacts[slide_kind(first)])
+        sample = load_image(artifacts[slide_kind(sample_number)])
 
     semaphore = asyncio.Semaphore(SLIDE_CONCURRENCY)
 
@@ -793,10 +1065,15 @@ async def check_slides_text(
     async def check(number: int) -> None:
         async with semaphore:
             try:
-                slide = load_image(artifacts[slide_kind(number)])
+                # A slide with the user's picture is checked as drawn, before the picture went in:
+                # text on the picture is not the slide's text.
+                slide = load_image(artifacts.get(slide_marked_kind(number)) or artifacts[slide_kind(number)])
                 issues, model = await pipeline.check_slide_text(slide, blocks[number])
             except LLMError as e:
                 log.warning("Text check of slide %d failed for session %d: %s", number, session_id, e)
+                return
+            except Exception:  # the check is optional: whatever breaks, the slides are still sent
+                log.exception("Text check of slide %d crashed for session %d", number, session_id)
                 return
         for issue in issues:
             log.info("Text check: session %d, slide %d: %s", session_id, number, issue.describe())
@@ -839,17 +1116,23 @@ async def send_slides(message: Message, paths: list[Path]) -> None:
     await message.answer_document(BufferedInputFile(pdf, filename=PDF_FILENAME))
 
 
-async def session_with_background(callback: CallbackQuery, db: Database) -> int | None:
-    """Active session whose background waits for «Принять» / «Перегенерировать», or None (stale button)."""
+async def session_at_background(callback: CallbackQuery, db: Database, stages: set[str]) -> int | None:
+    """Active session whose background is at one of `stages`, or None (stale button) after telling the user."""
     session_id = await db.get_active_session(callback.from_user.id)
-    if (
-        session_id is None
-        or await db.get_artifact(session_id, BACKGROUND) is None
-        or await db.get_artifact(session_id, BACKGROUND_ACCEPTED) is not None
-    ):
-        await callback.message.answer("Этот фон уже неактуален.", reply_markup=start_keyboard)
-        return None
-    return session_id
+    if session_id is not None:
+        stage = background_stage(await db.get_artifacts(session_id), await db.get_waiting_for(session_id))
+        if stage in stages:
+            return session_id
+    await callback.message.answer("Эта кнопка уже неактуальна.")
+    return None
+
+
+async def ack(callback: CallbackQuery) -> None:
+    """Confirm a button press (stops the spinner on the button). Telegram accepts it only
+    within a short time; a press delivered late (the bot was asleep, offline or restarting)
+    must still be handled, so a refused confirmation is ignored."""
+    with suppress(TelegramBadRequest):
+        await callback.answer()
 
 
 @router.message(CommandStart())
@@ -864,7 +1147,7 @@ async def cmd_start(message: Message) -> None:
 @router.callback_query(F.data == NEW_PRESENTATION)
 async def on_new_presentation(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
     session_id = await db.start_session(callback.from_user.id)
-    await callback.answer()
+    await ack(callback)
     await ask_description(callback.message, db, session_id)
 
 
@@ -872,7 +1155,7 @@ async def on_new_presentation(callback: CallbackQuery, db: Database, bank: Quest
 async def on_retry_step(
     callback: CallbackQuery, db: Database, bank: QuestionBank, pipeline: Pipeline, files_dir: Path
 ) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     if session_id is None:
         await callback.message.answer("Активной презентации нет.", reply_markup=start_keyboard)
@@ -886,6 +1169,8 @@ async def on_retry_step(
         await run_slides(callback.message, db, pipeline, files_dir, session_id)
     elif STYLE_REF in artifacts and BACKGROUND not in artifacts:
         await run_design(callback.message, db, pipeline, files_dir, session_id)
+    elif background_stage(artifacts, await db.get_waiting_for(session_id)) == BG_PENDING:
+        await run_background_change(callback.message, db, pipeline, files_dir, session_id)
     elif STYLE_REF not in artifacts and await db.get_waiting_for(session_id) is None:
         await run_pipeline(callback.message, db, bank, pipeline, session_id)
     else:
@@ -905,7 +1190,7 @@ async def session_with_summary(callback: CallbackQuery, db: Database) -> int | N
 async def on_survey_confirm(
     callback: CallbackQuery, db: Database, bank: QuestionBank, pipeline: Pipeline
 ) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await session_with_summary(callback, db)
     if session_id is None:
         return
@@ -917,7 +1202,7 @@ async def on_survey_confirm(
 
 @router.callback_query(F.data == SURVEY_EDIT)
 async def on_survey_edit(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await session_with_summary(callback, db)
     if session_id is None:
         return
@@ -927,7 +1212,7 @@ async def on_survey_edit(callback: CallbackQuery, db: Database, bank: QuestionBa
 
 @router.callback_query(F.data == SURVEY_SHOW)
 async def on_survey_show(callback: CallbackQuery, db: Database) -> None:
-    await callback.answer()
+    await ack(callback)
     if await session_with_summary(callback, db) is None:
         return
     await callback.message.edit_reply_markup(reply_markup=summary_keyboard)
@@ -935,7 +1220,7 @@ async def on_survey_show(callback: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data == SOURCES_DONE)
 async def on_sources_done(callback: CallbackQuery, db: Database, bank: QuestionBank, pipeline: Pipeline) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     if session_id is None or await db.get_waiting_for(session_id) != WAIT_SOURCES:
         await callback.message.answer("Это сообщение уже неактуально.", reply_markup=start_keyboard)
@@ -948,7 +1233,7 @@ async def on_sources_done(callback: CallbackQuery, db: Database, bank: QuestionB
 
 @router.callback_query(F.data.startswith(SKIP_QUESTION_PREFIX))
 async def on_skip_question(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     key = callback.data.removeprefix(SKIP_QUESTION_PREFIX)
     current = await current_question(db, bank.load(), session_id) if session_id is not None else None
@@ -963,7 +1248,7 @@ async def on_skip_question(callback: CallbackQuery, db: Database, bank: Question
 @router.callback_query(F.data.startswith(EDIT_QUESTION_PREFIX))
 async def on_edit_question(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
     """Forget the answer and ask the question again; the summary comes back after it."""
-    await callback.answer()
+    await ack(callback)
     session_id = await session_with_summary(callback, db)
     if session_id is None:
         return
@@ -980,18 +1265,61 @@ async def on_edit_question(callback: CallbackQuery, db: Database, bank: Question
 
 @router.callback_query(F.data == PLAN_ACCEPT)
 async def on_plan_accept(callback: CallbackQuery, db: Database) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await session_with_plan(callback, db)
     if session_id is None:
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await db.set_waiting_for(session_id, WAIT_STYLE_REF)
-    await callback.message.answer(STYLE_REF_REQUEST, reply_markup=style_ref_keyboard)
+    await show_slide_images(callback.message, db, session_id, SLIDE_IMAGES_REQUEST)
+
+
+@router.callback_query(F.data.startswith(SLIDE_IMAGE_PREFIX))
+async def on_slide_image(callback: CallbackQuery, db: Database) -> None:
+    """«Слайд N»: wait for the photo for that slide."""
+    await ack(callback)
+    session_id = await db.get_active_session(callback.from_user.id)
+    waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
+    if not in_slide_images_step(waiting_for):  # while a caption is awaited, another slide means "no caption"
+        await callback.message.answer("Эта кнопка уже неактуальна.")
+        return
+    number = int(callback.data.removeprefix(SLIDE_IMAGE_PREFIX))
+    if await db.get_artifact(session_id, user_image_kind(number)) is not None:
+        await callback.message.answer("Фото для этого слайда уже добавлено.")
+        return
+    await db.set_waiting_for(session_id, f"{WAIT_SLIDE_PHOTO_PREFIX}{number}")
+    await callback.message.answer(f"Пришлите фото для слайда {number}.")
+
+
+@router.callback_query(F.data == CAPTION_SKIP)
+async def on_caption_skip(callback: CallbackQuery, db: Database) -> None:
+    await ack(callback)
+    session_id = await db.get_active_session(callback.from_user.id)
+    waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
+    number = waiting_number(waiting_for, WAIT_CAPTION_PREFIX)
+    if number is None:
+        await callback.message.answer("Эта кнопка уже неактуальна.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    text = f"Фото для слайда {number} добавлено без подписи. Можно выбрать следующий слайд."
+    await show_slide_images(callback.message, db, session_id, text)
+
+
+@router.callback_query(F.data == SLIDE_IMAGES_DONE)
+async def on_slide_images_done(callback: CallbackQuery, db: Database) -> None:
+    """«Готово» / «Продолжить без фото»: go on to the style reference."""
+    await ack(callback)
+    session_id = await db.get_active_session(callback.from_user.id)
+    waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
+    if not in_slide_images_step(waiting_for):
+        await callback.message.answer("Эта кнопка уже неактуальна.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await finish_slide_images(callback.message, db, session_id)
 
 
 @router.callback_query(F.data == PLAN_EDIT)
 async def on_plan_edit(callback: CallbackQuery, db: Database) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await session_with_plan(callback, db)
     if session_id is None:
         return
@@ -1006,7 +1334,7 @@ async def on_plan_edit(callback: CallbackQuery, db: Database) -> None:
 async def on_style_ref_skip(
     callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path
 ) -> None:
-    await callback.answer()
+    await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     if session_id is None or await db.get_waiting_for(session_id) != WAIT_STYLE_REF:
         await callback.message.answer("Это сообщение уже неактуально.", reply_markup=start_keyboard)
@@ -1017,34 +1345,70 @@ async def on_style_ref_skip(
     await run_design(callback.message, db, pipeline, files_dir, session_id)
 
 
-@router.callback_query(F.data == BACKGROUND_REGENERATE)
-async def on_background_regenerate(
-    callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path
-) -> None:
-    await callback.answer()
-    session_id = await session_with_background(callback, db)
-    if session_id is None:
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await run_design(callback.message, db, pipeline, files_dir, session_id)
-
-
 @router.callback_query(F.data == BACKGROUND_ACCEPT)
 async def on_background_accept(
     callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path
 ) -> None:
-    await callback.answer()
-    session_id = await session_with_background(callback, db)
+    """Accept the first background: under it, while the comment is awaited, or after the change failed."""
+    await ack(callback)
+    session_id = await session_at_background(callback, db, {BG_OFFERED, BG_COMMENT, BG_PENDING})
+    if session_id is None:
+        return
+    if session_id in _running:  # the second background is being drawn right now
+        await callback.message.answer("Работа уже идёт, подождите немного.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await db.set_waiting_for(session_id, None)
+    await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
+    await run_slides(callback.message, db, pipeline, files_dir, session_id)
+
+
+@router.callback_query(F.data == BACKGROUND_EDIT)
+async def on_background_edit(callback: CallbackQuery, db: Database) -> None:
+    await ack(callback)
+    session_id = await session_at_background(callback, db, {BG_OFFERED})
     if session_id is None:
         return
     await callback.message.edit_reply_markup(reply_markup=None)
+    await db.save_artifact(session_id, BACKGROUND_ATTEMPT, ATTEMPT_EDIT, model="user")
+    await db.set_waiting_for(session_id, WAIT_BACKGROUND_COMMENT)
+    await callback.message.answer(BACKGROUND_COMMENT_REQUEST)
+
+
+@router.callback_query(F.data == BACKGROUND_REDRAW)
+async def on_background_redraw(
+    callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path
+) -> None:
+    await ack(callback)
+    session_id = await session_at_background(callback, db, {BG_OFFERED})
+    if session_id is None:
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await db.save_artifact(session_id, BACKGROUND_ATTEMPT, ATTEMPT_REDRAW, model="user")
+    await run_background_change(callback.message, db, pipeline, files_dir, session_id)
+
+
+@router.callback_query(F.data.startswith(BACKGROUND_PICK_PREFIX))
+async def on_background_pick(
+    callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path
+) -> None:
+    await ack(callback)
+    session_id = await session_at_background(callback, db, {BG_CHOICE})
+    if session_id is None:
+        return
+    choice = callback.data.removeprefix(BACKGROUND_PICK_PREFIX)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await db.save_artifact(session_id, BACKGROUND_CHOICE, choice, model="user")
     await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
+    await callback.message.answer(f"Беру вариант {choice}.")
     await run_slides(callback.message, db, pipeline, files_dir, session_id)
 
 
 def unexpected_file_text(waiting_for: str | None) -> str:
     if waiting_for == WAIT_DESCRIPTION:
         return "Сначала опишите презентацию текстом — файлы можно будет прислать на следующем шаге."
+    if waiting_for == WAIT_BACKGROUND_COMMENT:
+        return "Напишите, что понравилось и что нет, текстом."
     return "Сейчас я не жду файлов."
 
 
@@ -1054,6 +1418,18 @@ async def on_photo(message: Message, db: Database, pipeline: Pipeline, files_dir
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
     if waiting_for == WAIT_SOURCES:
         await receive_source_file(message, db, files_dir, session_id, message.photo[-1], None, "image/jpeg")
+        return
+    number = waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX)
+    if number is not None:
+        await receive_slide_photo(message, db, files_dir, session_id, number)
+        return
+    if waiting_for == WAIT_SLIDE_IMAGES:
+        await message.answer("Сначала нажмите номер слайда, для которого это фото.")
+        return
+    if waiting_number(waiting_for, WAIT_CAPTION_PREFIX) is not None:
+        await message.answer(
+            "Пришлите подпись текстом или нажмите «Продолжить без подписи».", reply_markup=caption_keyboard
+        )
         return
     if waiting_for != WAIT_STYLE_REF:
         await message.answer(unexpected_file_text(waiting_for))
@@ -1068,6 +1444,9 @@ async def on_document(
 ) -> None:
     session_id = await db.get_active_session(message.from_user.id)
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
+    if in_slide_images_step(waiting_for):
+        await message.answer("Пришлите изображение как фото, а не файлом.")
+        return
     if waiting_for == WAIT_STYLE_REF:
         # An image sent "as a file" keeps full quality; accept it like a photo.
         mime_type = message.document.mime_type or ""
@@ -1118,6 +1497,34 @@ async def on_answer(
     if waiting_for == WAIT_STYLE_REF:
         await message.answer("Пришлите картинку-референс или нажмите «Пропустить».", reply_markup=style_ref_keyboard)
         return
+    caption_for = waiting_number(waiting_for, WAIT_CAPTION_PREFIX)
+    if caption_for is not None:
+        caption = message.text.strip()
+        if len(caption) > MAX_CAPTION_CHARS:
+            await message.answer(
+                f"Подпись слишком длинная: {len(caption)} символов, можно до {MAX_CAPTION_CHARS}. "
+                "Сократите, пожалуйста.",
+                reply_markup=caption_keyboard,
+            )
+            return
+        image = UserImage.from_json(await db.get_artifact(session_id, user_image_kind(caption_for)))
+        image = UserImage(image.path, image.width, image.height, caption)
+        await db.save_artifact(session_id, user_image_kind(caption_for), image.to_json(), model="user")
+        await show_slide_images(message, db, session_id, "Подпись сохранена. Можно выбрать следующий слайд.")
+        return
+    photo_for = waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX)
+    if photo_for is not None:
+        await message.answer(f"Пришлите фото для слайда {photo_for}.")
+        return
+    if waiting_for == WAIT_SLIDE_IMAGES:
+        text = "Нажмите номер слайда, чтобы добавить фото, или кнопку внизу, чтобы продолжить."
+        await show_slide_images(message, db, session_id, text)
+        return
+    if waiting_for == WAIT_BACKGROUND_COMMENT:
+        await db.save_artifact(session_id, BACKGROUND_COMMENT, message.text.strip(), model="user")
+        await db.set_waiting_for(session_id, None)
+        await run_background_change(message, db, pipeline, files_dir, session_id)
+        return
     if waiting_for == WAIT_DESCRIPTION:
         await notice_links(message)
         await db.save_artifact(session_id, DESCRIPTION, message.text.strip(), model="user")
@@ -1140,7 +1547,15 @@ async def on_answer(
         # Slides are being drawn, or the previous attempt failed: continue.
         await run_slides(message, db, pipeline, files_dir, session_id)
         return
-    if BACKGROUND in artifacts:
+    stage = background_stage(artifacts, waiting_for)
+    if stage == BG_CHOICE:
+        await message.answer("Выберите фон выше:", reply_markup=background_choice_keyboard)
+        return
+    if stage == BG_PENDING:
+        # The second background is being drawn, or the previous attempt failed: continue.
+        await run_background_change(message, db, pipeline, files_dir, session_id)
+        return
+    if stage == BG_OFFERED:
         await message.answer("Посмотрите фон выше и нажмите кнопку:", reply_markup=background_keyboard)
         return
     if STYLE_REF in artifacts:

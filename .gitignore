@@ -18,3 +18,9 @@ data/
 
 # Working prompts (private)
 prompts/
+
+# Copies of the server data for debugging (scripts/snapshot.sh)
+snapshots/
+
+# Server address and SSH key path (public repository)
+scripts/server.sh

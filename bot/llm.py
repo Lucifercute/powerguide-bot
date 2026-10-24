@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+import aiohttp
 import httpx
 from google import genai
 from google.genai import errors, types
@@ -18,6 +19,10 @@ RETRY_DELAYS = (3, 10)  # seconds before 2nd and 3rd attempt on the same model
 # is better than falling back to the pricier Pro model, which also draws in a slightly different style.
 IMAGE_RETRY_DELAYS = (30, 60)
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
+
+# Network failures: the SDK sends sync requests with httpx and async ones with aiohttp, whose
+# timeouts surface as a bare TimeoutError. All of them are retried like a busy server.
+NETWORK_ERRORS = (httpx.TransportError, aiohttp.ClientError, TimeoutError)
 
 T = TypeVar("T")
 
@@ -94,7 +99,7 @@ class TextLLM:
         Only AI Studio models can read such a Part; Vertex models will reject the request."""
         try:
             file = await self.client.aio.files.upload(file=path, config=types.UploadFileConfig(mime_type=mime_type))
-        except (errors.APIError, httpx.TransportError) as e:
+        except (errors.APIError, *NETWORK_ERRORS) as e:
             raise LLMError(f"upload failed: {e}", quota_exceeded=False) from e
         return types.Part.from_uri(file_uri=file.uri, mime_type=mime_type)
 
@@ -143,7 +148,7 @@ async def _generate_with_fallback(
                     break  # give up on this model, try the next one
                 await asyncio.sleep(retry_delays[attempt])
                 continue
-            except httpx.TransportError as e:  # network errors and timeouts
+            except NETWORK_ERRORS as e:  # network errors and timeouts
                 last_error = e
                 log.warning("Gemini %s attempt %d network error: %r", target.name, attempt + 1, e)
                 if attempt == len(retry_delays):

@@ -13,6 +13,7 @@ from bot.questions import Survey
 from bot.search import SearchResult, WebSearch
 from bot.sources import SourceFile
 from bot.textcheck import TextIssue, compare, confirmed, expected_text
+from bot.user_images import UserImage, hex_color
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,14 @@ BACKGROUND_FIELDS = "background_fields"  # JSON of BackgroundFields, reused on r
 BACKGROUND = "background"  # path to the accepted (or last generated) background image
 STYLE = "style"  # result of prompt 05, the style text for slide generation
 BACKGROUND_ACCEPTED = "background_accepted"  # marker: the user pressed «Принять» under the background
+# The one change of the background the user may ask for:
+BACKGROUND_ATTEMPT = "background_attempt"  # "edit" (fix by a comment) or "redraw" (a different one)
+BACKGROUND_COMMENT = "background_comment"  # the user's comment for "edit"
+BACKGROUND_ALT = "background_alt"  # path to the second background
+BACKGROUND_ALT_FIELDS = "background_alt_fields"  # JSON of BackgroundFields for "redraw", reused on retry
+BACKGROUND_CHOICE = "background_choice"  # "2" = the user picked the second background; else the first
+ATTEMPT_EDIT = "edit"
+ATTEMPT_REDRAW = "redraw"
 
 # Stage В (slides). Artifact kinds:
 DESCRIPTIONS = "descriptions"  # result of prompt 06: «Изображение N» blocks
@@ -68,6 +77,28 @@ def slide_kind(number: int) -> str:
 def slide_prompt_kind(number: int) -> str:
     """Artifact kind of the exact prompt slide N was drawn with: kept to trace problems back."""
     return f"slide_prompt_{number:02d}"
+
+
+def user_image_kind(number: int) -> str:
+    """Artifact kind of the user's picture for slide N: JSON of UserImage."""
+    return f"user_image_{number:02d}"
+
+
+def slide_marked_kind(number: int) -> str:
+    """Artifact kind of slide N as drawn, with the marker area, before the user's picture is
+    pasted in: path to the image. The text check reads it, so text on the picture doesn't count."""
+    return f"slide_marked_{number:02d}"
+
+
+def user_image_failed_kind(number: int) -> str:
+    """Marker: the user's picture could not be put on slide N, the slide was drawn without it."""
+    return f"user_image_failed_{number:02d}"
+
+
+def plan_slide_numbers(plan: str) -> list[int]:
+    """Slide numbers of the plan («СЛАЙД N» lines), in order, without repeats."""
+    numbers = [int(n) for n in _PLAN_SLIDE.findall(plan)]
+    return list(dict.fromkeys(numbers))
 
 
 def text_check_kind(number: int) -> str:
@@ -84,14 +115,24 @@ TEXT_CHECK_CONFIG = types.GenerateContentConfig(
 )
 SLIDE_PROMPT = "07_slide"
 SLIDE_REFERENCE_PROMPT = "07a_slide_reference"
+USER_IMAGES_PROMPT = "06a_user_images"  # added to 06 when the user attached pictures
+USER_IMAGE_AREA_PROMPT = "07b_user_image_area"  # added to 07 for a slide with the user's picture
+NO_USER_IMAGE_PROMPT = "07c_no_user_image"  # added to 07 when the area didn't come out: draw without it
+_PLAN_SLIDE = re.compile(r"^[\s#*_]*СЛАЙД\s+(\d+)", re.MULTILINE | re.IGNORECASE)
 MAX_SLIDES = 10  # every slide is a paid image request
 _DESCRIPTION_HEADER = re.compile(r"^[\s#*_«\"]*Изображение\s+(\d+)\b", re.MULTILINE)
 
 BACKGROUND_PROMPT = "04_background"
 BACKGROUND_FIELDS_PROMPT = "04a_background_fields"
+BACKGROUND_EDIT_PROMPT = "04b_background_edit"
+BACKGROUND_REDRAW_PROMPT = "04c_background_redraw"  # added to 04 when the previous background is attached
+BACKGROUND_FIELDS_REDRAW_PROMPT = "04d_background_fields_redraw"  # added to 04a for a different direction
 STYLE_PROMPT = "05_style"
 
 RATIO_ANSWER_KEY = "design.ratio"
+RESEARCH_ANSWER_KEY = "source.research"  # «Нужен ли поиск информации в открытых источниках?»
+# An answer starting like this turns web search off; anything else (incl. «Не указано») leaves it to 02a.
+_NO_SEARCH = re.compile(r"^\W*(нет\b|не\s+(нуж|треб|надо|ищ|стоит))", re.IGNORECASE)
 # Aspect ratios the image models accept (ImageConfig.aspect_ratio).
 SUPPORTED_RATIOS = ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9")
 DEFAULT_RATIO = "16:9"
@@ -191,6 +232,12 @@ def parse_aspect_ratio(answer: str | None) -> str:
             value = math.log(width / height)
             return min(SUPPORTED_RATIOS, key=lambda r: abs(math.log(_ratio_value(r)) - value))
     return DEFAULT_RATIO
+
+
+def search_declined(answer: str | None) -> bool:
+    """The user said web search is not needed («нет», «не нужен», «не требуется»…). Decided here,
+    not by the models: the ТЗ turns «нет» into «не требуется», and 02a read that as «not forbidden»."""
+    return bool(_NO_SEARCH.match(answer or ""))
 
 
 def _ratio_value(ratio: str) -> float:
@@ -370,9 +417,15 @@ class Pipeline:
             raise ValueError(f"expected a JSON list, got: {text[:200]}")
         return [q.strip() for q in queries if isinstance(q, str) and q.strip()][: self.max_queries]
 
-    async def background_fields(self, tz: str, has_reference: bool) -> BackgroundFields:
-        """Fill the bracketed fields of prompt 04 from the ТЗ. Raises LLMError."""
+    async def background_fields(
+        self, tz: str, has_reference: bool, previous: BackgroundFields | None = None
+    ) -> BackgroundFields:
+        """Fill the bracketed fields of prompt 04 from the ТЗ. previous: fields of a background
+        the user wants redrawn; the new ones then take a different direction. Raises LLMError."""
         template = load_prompt(self.prompts_dir, BACKGROUND_FIELDS_PROMPT)
+        if previous is not None:
+            template += "\n\n" + load_prompt(self.prompts_dir, BACKGROUND_FIELDS_REDRAW_PROMPT)
+            template += f"\n\nПРЕДЫДУЩИЙ ВАРИАНТ\n\n{previous.model_dump_json()}"
         reference = "да" if has_reference else "нет"
         text, _ = await self.llm.generate(
             f"{template}\n\nПОЛЬЗОВАТЕЛЬ ПРИЛОЖИЛ ГРАФИЧЕСКИЙ РЕФЕРЕНС: {reference}\n\n"
@@ -387,15 +440,27 @@ class Pipeline:
             raise LLMError(f"malformed background fields: {text[:200]}", quota_exceeded=False) from e
 
     async def background(
-        self, fields: BackgroundFields, ratio: str, reference: Image | None
+        self, fields: BackgroundFields, ratio: str, reference: Image | None, previous: Image | None = None
     ) -> tuple[Image, str]:
-        """Prompt 04 → background image. Raises LLMError."""
+        """Prompt 04 → background image. previous: a background the user wants redrawn; it is
+        attached last, and the new one must differ from it. Raises LLMError."""
         prompt = build_background_prompt(load_prompt(self.prompts_dir, BACKGROUND_PROMPT), ratio, fields)
+        if previous is not None:
+            prompt += "\n\n" + load_prompt(self.prompts_dir, BACKGROUND_REDRAW_PROMPT)
         log.info("Background prompt:\n%s", prompt)
         contents: list = [prompt]
-        if reference is not None:
-            contents.append(types.Part.from_bytes(data=reference.data, mime_type=reference.mime_type))
+        for image in (reference, previous):
+            if image is not None:
+                contents.append(types.Part.from_bytes(data=image.data, mime_type=image.mime_type))
         return await self.images.generate(contents, aspect_ratio=ratio)
+
+    async def edit_background(self, background: Image, comment: str, ratio: str) -> tuple[Image, str]:
+        """Prompt 04b: fix the background by the user's comment, keeping what they liked. Raises LLMError."""
+        prompt = load_prompt(self.prompts_dir, BACKGROUND_EDIT_PROMPT).replace("{ratio}", ratio)
+        prompt = prompt.replace("{comment}", comment.strip())
+        log.info("Background edit prompt:\n%s", prompt)
+        image = types.Part.from_bytes(data=background.data, mime_type=background.mime_type)
+        return await self.images.generate([prompt, image], aspect_ratio=ratio)
 
     async def style(self, background: Image, ratio: str) -> tuple[str, str]:
         """Prompt 05 with the background as the reference → style text. Raises LLMError."""
@@ -403,11 +468,23 @@ class Pipeline:
         image = types.Part.from_bytes(data=background.data, mime_type=background.mime_type)
         return await self.llm.generate([image, prompt])
 
-    async def descriptions(self, plan: str) -> tuple[str, str]:
-        """Prompt 06 on the plan → «Изображение N» blocks. Raises LLMError, also when the
+    async def descriptions(self, plan: str, images: dict[int, UserImage] | None = None) -> tuple[str, str]:
+        """Prompt 06 on the plan → «Изображение N» blocks. images: the user's pictures by slide
+        number; their slides get a place for the picture (06a). Raises LLMError, also when the
         answer has no blocks, so a malformed result is not saved and the retry asks again."""
         template = load_prompt(self.prompts_dir, DESCRIPTIONS_PROMPT)
-        text, model = await self.llm.generate(f"{template}\n\nПОСЛАЙДОВЫЙ ПЛАН ПРЕЗЕНТАЦИИ\n\n{plan}")
+        request = f"{template}\n\nПОСЛАЙДОВЫЙ ПЛАН ПРЕЗЕНТАЦИИ\n\n{plan}"
+        if images:
+            lines = [
+                f"Слайд {n}: изображение с пропорциями {image.ratio} (ширина к высоте); "
+                + (f"подпись «{image.caption}»." if image.caption else "без подписи.")
+                for n, image in sorted(images.items())
+            ]
+            request = (
+                f"{template}\n\n{load_prompt(self.prompts_dir, USER_IMAGES_PROMPT)}\n\n"
+                f"ПОСЛАЙДОВЫЙ ПЛАН ПРЕЗЕНТАЦИИ\n\n{plan}\n\nИЗОБРАЖЕНИЯ ПОЛЬЗОВАТЕЛЯ\n\n" + "\n".join(lines)
+            )
+        text, model = await self.llm.generate(request)
         if not split_descriptions(text):
             raise LLMError(f"no «Изображение N» blocks in descriptions: {text[:200]}", quota_exceeded=False)
         return text, model
@@ -431,21 +508,37 @@ class Pipeline:
         text, model = await self.llm.generate([image, prompt], config=TEXT_CHECK_CONFIG)
         return compare(expected, text), model
 
-    def slide_prompt(self, number: int, description: str, style: str, ratio: str, with_sample: bool) -> str:
+    def slide_prompt(
+        self,
+        number: int,
+        description: str,
+        style: str,
+        ratio: str,
+        with_sample: bool,
+        image: UserImage | None = None,
+        marker: tuple[int, int, int] | None = None,
+    ) -> str:
         """Text of prompt 07-1 for one slide. Only this slide's description goes in, so the
-        model can't pull text from other slides. with_sample: slide 1 will be attached as a
-        sample of the design, and the prompt says how to use it."""
+        model can't pull text from other slides. with_sample: a finished slide will be attached
+        as a sample of the design, and the prompt says how to use it. image and marker: the slide
+        has a place for the user's picture; with a marker color it is drawn as a solid area of
+        that color (07b), without one the slide is drawn without the place (07c)."""
         prompt = build_slide_prompt(load_prompt(self.prompts_dir, SLIDE_PROMPT), number, description, style, ratio)
         if with_sample:
             prompt += "\n\n" + load_prompt(self.prompts_dir, SLIDE_REFERENCE_PROMPT)
+        if image is not None and marker is not None:
+            area = load_prompt(self.prompts_dir, USER_IMAGE_AREA_PROMPT)
+            prompt += "\n\n" + area.replace("{color}", hex_color(marker)).replace("{ratio}", image.ratio)
+        elif image is not None:
+            prompt += "\n\n" + load_prompt(self.prompts_dir, NO_USER_IMAGE_PROMPT)
         return prompt
 
     async def slide(
-        self, prompt: str, ratio: str, background: Image, first_slide: Image | None
+        self, prompt: str, ratio: str, background: Image, sample: Image | None
     ) -> tuple[Image, str]:
-        """Slide prompt (see slide_prompt) + background (+ slide 1 as a design sample) → image.
+        """Slide prompt (see slide_prompt) + background (+ a finished slide as a design sample) → image.
         Raises LLMError."""
         contents: list = [prompt, types.Part.from_bytes(data=background.data, mime_type=background.mime_type)]
-        if first_slide is not None:
-            contents.append(types.Part.from_bytes(data=first_slide.data, mime_type=first_slide.mime_type))
+        if sample is not None:
+            contents.append(types.Part.from_bytes(data=sample.data, mime_type=sample.mime_type))
         return await self.images.generate(contents, aspect_ratio=ratio)

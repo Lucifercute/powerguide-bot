@@ -1,0 +1,10 @@
+.venv
+.git
+.idea
+__pycache__
+*.py[oc]
+.env
+data
+prompts
+snapshots
+scripts

@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: powerguide-bot
+    restart: unless-stopped
+    env_file: .env
+    # Same uid as the host user (opc), so files in data/ stay editable from the host.
+    user: "1000:1000"
+    volumes:
+      # :z labels the folders for SELinux (Enforcing on the server).
+      - ./data:/app/data:z
+      - ./prompts:/app/prompts:ro,z
+    # A runaway bot gets restarted instead of starving schedule-bot on the same server.
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

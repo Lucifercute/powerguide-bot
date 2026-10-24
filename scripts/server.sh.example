@@ -1,0 +1,5 @@
+# Copy to scripts/server.sh and fill in (server.sh is not in git: the repository is public).
+SERVER="user@server-ip"
+SSH_KEY="$HOME/.ssh/your_key"
+REMOTE_DIR="/home/user/powerguide-bot"
+SSH="ssh -i $SSH_KEY -o BatchMode=yes"

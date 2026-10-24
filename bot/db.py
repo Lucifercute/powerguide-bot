@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     INTEGER NOT NULL,
     status      TEXT    NOT NULL DEFAULT 'in_progress',  -- in_progress | completed | cancelled
-    waiting_for TEXT,  -- user input the bot expects outside the normal flow: NULL | 'description' | 'source_files' | 'survey_confirm' | 'plan_edit' | 'style_ref'
+    waiting_for TEXT,  -- user input the bot expects outside the normal flow: NULL | 'description' | 'source_files' | 'survey_confirm' | 'plan_edit' | 'style_ref' | 'background_comment' | 'slide_images' | 'slide_photo:N' | 'photo_caption:N'
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     finished_at TEXT
 );
