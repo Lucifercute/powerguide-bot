@@ -55,6 +55,7 @@ STYLE_REF = "style_ref"  # path to the user's reference image; "" = skipped
 BACKGROUND_FIELDS = "background_fields"  # JSON of BackgroundFields, reused on regeneration
 BACKGROUND = "background"  # path to the accepted (or last generated) background image
 STYLE = "style"  # result of prompt 05, the style text for slide generation
+STYLE_PRESET = "style_preset"  # number of the prepared design the user picked: its background and style, no 04/05
 BACKGROUND_ACCEPTED = "background_accepted"  # marker: the user pressed «Принять» under the background
 # The one change of the background the user may ask for:
 BACKGROUND_ATTEMPT = "background_attempt"  # "edit" (fix by a comment) or "redraw" (a different one)

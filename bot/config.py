@@ -12,6 +12,7 @@ class Config:
     db_path: Path
     questions_path: Path
     prompts_dir: Path
+    presets_dir: Path  # prepared designs the user can pick (bot/presets.py)
     gemini_api_key: str
     gemini_text_models: list[str]
     tavily_api_key: str | None
@@ -50,6 +51,7 @@ def load_config() -> Config:
         db_path=Path(os.getenv("DB_PATH", "data/bot.db")),
         questions_path=Path(os.getenv("QUESTIONS_PATH", "questions.yaml")),
         prompts_dir=Path(os.getenv("PROMPTS_DIR", "prompts")),
+        presets_dir=Path(os.getenv("PRESETS_DIR", "presets")),
         gemini_api_key=_required("GEMINI_API_KEY"),
         gemini_text_models=_split(models),
         tavily_api_key=os.getenv("TAVILY_API_KEY") or None,

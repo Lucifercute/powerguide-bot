@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Send prompts/ to the server. No restart needed: the bot reads prompts on every call.
+# Send prompts/ and presets/ to the server. No restart needed: the bot reads both on every use.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/server.sh
 
 rsync -az --delete -e "$SSH" prompts/ "$SERVER:$REMOTE_DIR/prompts/"
-echo "Prompts synced."
+rsync -az --delete -e "$SSH" presets/ "$SERVER:$REMOTE_DIR/presets/"
+echo "Prompts and presets synced."

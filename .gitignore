@@ -16,8 +16,9 @@ data/
 # IDE
 .idea/
 
-# Working prompts (private)
+# Working prompts and prepared designs (private)
 prompts/
+presets/
 
 # Copies of the server data for debugging (scripts/snapshot.sh)
 snapshots/

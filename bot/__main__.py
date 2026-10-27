@@ -10,6 +10,7 @@ from bot.db import Database
 from bot.handlers import router
 from bot.llm import ImageLLM, TextLLM
 from bot.pipeline import Pipeline
+from bot.presets import PresetStore
 from bot.questions import QuestionBank
 from bot.search import WebSearch
 
@@ -37,13 +38,14 @@ async def main() -> None:
         prompts_dir=config.prompts_dir,
         max_queries=config.search_max_queries,
     )
-    # Values passed here are injected into handlers by parameter name (db, bank, pipeline, files_dir, soffice).
+    # Values passed here are injected into handlers by parameter name (db, bank, pipeline, files_dir, soffice, presets).
     dp = Dispatcher(
         db=db,
         bank=QuestionBank(config.questions_path),
         pipeline=pipeline,
         files_dir=config.files_dir,
         soffice=config.libreoffice_path,
+        presets=PresetStore(config.presets_dir),
     )
     dp.include_router(router)
 

@@ -14,6 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -47,6 +48,7 @@ from bot.pipeline import (
     SOURCES_NOTE,
     STEPS,
     STYLE,
+    STYLE_PRESET,
     STYLE_REF,
     SURVEY_CONFIRMED,
     TZ,
@@ -63,6 +65,7 @@ from bot.pipeline import (
     user_image_failed_kind,
     user_image_kind,
 )
+from bot.presets import Preset, PresetStore
 from bot.sources import (
     BINARY_TYPES,
     OLD_FORMATS,
@@ -96,6 +99,7 @@ SURVEY_SHOW = "survey_show"
 SKIP_QUESTION_PREFIX = "skip_question:"  # + question key: «Пропустить / Не знаю» under a question
 EDIT_QUESTION_PREFIX = "edit_question:"  # + question key: re-ask this question from the summary
 STYLE_REF_SKIP = "style_ref_skip"
+STYLE_PRESET_PREFIX = "style_preset:"  # + N: the «Стиль N» button
 WAIT_STYLE_REF = "style_ref"  # sessions.waiting_for while the bot waits for a reference image
 BACKGROUND_ACCEPT = "background_accept"  # accept the first background
 BACKGROUND_EDIT = "background_edit"
@@ -109,6 +113,7 @@ MAX_IMAGE_BYTES = 10_000_000
 SLIDE_CONCURRENCY = 1
 TEXT_CHECK_CONCURRENCY = 3  # text requests: Vertex has no trouble with a few at once
 TELEGRAM_ALBUM_LIMIT = 10
+MAX_PRESETS_SHOWN = 10  # one photo message each: more would flood the chat
 PDF_FILENAME = "Презентация.pdf"
 IMAGE_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 TELEGRAM_LIMIT = 4096
@@ -252,6 +257,11 @@ STYLE_REF_REQUEST = (
     "Теперь дизайн слайдов.\n\n"
     "Если у вас есть картинка, стиль которой нравится (фото, скриншот, слайд из другой презентации), "
     "пришлите её одним изображением — фон сделаю в похожем стиле. Если нет — нажмите «Пропустить»."
+)
+STYLE_CHOICE_INTRO = "Теперь дизайн слайдов. Ниже — готовые стили: выберите один кнопкой под картинкой."
+STYLE_CHOICE_REST = (
+    "Не подошло? Пришлите свою картинку, стиль которой нравится (фото, скриншот, слайд из другой "
+    "презентации), — фон сделаю в похожем стиле. Если ничего не нужно — нажмите «Пропустить»."
 )
 
 # Sessions whose pipeline is running right now: protects from double-clicks and
@@ -615,21 +625,41 @@ async def load_user_images(db: Database, session_id: int) -> dict[int, UserImage
     return images
 
 
-async def show_slide_images(message: Message, db: Database, session_id: int, text: str) -> None:
+async def show_slide_images(
+    message: Message, db: Database, presets: PresetStore, session_id: int, text: str
+) -> None:
     """The «Слайд N» buttons; a plan without «СЛАЙД N» lines goes straight to the style reference."""
     numbers = plan_slide_numbers(await db.get_artifact(session_id, PLAN.kind) or "")[:MAX_SLIDES]
     if not numbers:
-        await finish_slide_images(message, db, session_id)
+        await finish_slide_images(message, db, presets, session_id)
         return
     await db.set_waiting_for(session_id, WAIT_SLIDE_IMAGES)
     with_image = set(await load_user_images(db, session_id))
     await message.answer(text, reply_markup=slide_images_keyboard(numbers, with_image))
 
 
-async def finish_slide_images(message: Message, db: Database, session_id: int) -> None:
+async def finish_slide_images(message: Message, db: Database, presets: PresetStore, session_id: int) -> None:
     await db.save_artifact(session_id, SLIDE_IMAGES_DONE, "", model="user")
     await db.set_waiting_for(session_id, WAIT_STYLE_REF)
-    await message.answer(STYLE_REF_REQUEST, reply_markup=style_ref_keyboard)
+    await show_style_choice(message, presets.load())
+
+
+def style_preset_keyboard(preset: Preset) -> InlineKeyboardMarkup:
+    button = InlineKeyboardButton(text=f"Стиль {preset.number}", callback_data=f"{STYLE_PRESET_PREFIX}{preset.number}")
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+async def show_style_choice(message: Message, presets: list[Preset]) -> None:
+    """Each prepared design as its own preview with the «Стиль N» button under it, then the
+    request for a reference with «Пропустить». Without prepared designs: only that request."""
+    if not presets:
+        await message.answer(STYLE_REF_REQUEST, reply_markup=style_ref_keyboard)
+        return
+    await message.answer(STYLE_CHOICE_INTRO)
+    for preset in presets[:MAX_PRESETS_SHOWN]:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+        await message.answer_photo(FSInputFile(preset.preview), reply_markup=style_preset_keyboard(preset))
+    await message.answer(STYLE_CHOICE_REST, reply_markup=style_ref_keyboard)
 
 
 def waiting_number(waiting_for: str | None, prefix: str) -> int | None:
@@ -1264,13 +1294,13 @@ async def on_edit_question(callback: CallbackQuery, db: Database, bank: Question
 
 
 @router.callback_query(F.data == PLAN_ACCEPT)
-async def on_plan_accept(callback: CallbackQuery, db: Database) -> None:
+async def on_plan_accept(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
     await ack(callback)
     session_id = await session_with_plan(callback, db)
     if session_id is None:
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await show_slide_images(callback.message, db, session_id, SLIDE_IMAGES_REQUEST)
+    await show_slide_images(callback.message, db, presets, session_id, SLIDE_IMAGES_REQUEST)
 
 
 @router.callback_query(F.data.startswith(SLIDE_IMAGE_PREFIX))
@@ -1291,7 +1321,7 @@ async def on_slide_image(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data == CAPTION_SKIP)
-async def on_caption_skip(callback: CallbackQuery, db: Database) -> None:
+async def on_caption_skip(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
     await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
@@ -1301,11 +1331,11 @@ async def on_caption_skip(callback: CallbackQuery, db: Database) -> None:
         return
     await callback.message.edit_reply_markup(reply_markup=None)
     text = f"Фото для слайда {number} добавлено без подписи. Можно выбрать следующий слайд."
-    await show_slide_images(callback.message, db, session_id, text)
+    await show_slide_images(callback.message, db, presets, session_id, text)
 
 
 @router.callback_query(F.data == SLIDE_IMAGES_DONE)
-async def on_slide_images_done(callback: CallbackQuery, db: Database) -> None:
+async def on_slide_images_done(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
     """«Готово» / «Продолжить без фото»: go on to the style reference."""
     await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
@@ -1314,7 +1344,7 @@ async def on_slide_images_done(callback: CallbackQuery, db: Database) -> None:
         await callback.message.answer("Эта кнопка уже неактуальна.")
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await finish_slide_images(callback.message, db, session_id)
+    await finish_slide_images(callback.message, db, presets, session_id)
 
 
 @router.callback_query(F.data == PLAN_EDIT)
@@ -1343,6 +1373,34 @@ async def on_style_ref_skip(
     await db.save_artifact(session_id, STYLE_REF, "", model="user")
     await db.set_waiting_for(session_id, None)
     await run_design(callback.message, db, pipeline, files_dir, session_id)
+
+
+@router.callback_query(F.data.startswith(STYLE_PRESET_PREFIX))
+async def on_style_preset(
+    callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path, presets: PresetStore
+) -> None:
+    """«Стиль N»: the prepared design replaces the reference, the background (04) and the style (05);
+    the background counts as accepted, so the slides start at once."""
+    await ack(callback)
+    session_id = await db.get_active_session(callback.from_user.id)
+    if session_id is None or await db.get_waiting_for(session_id) != WAIT_STYLE_REF:
+        await callback.message.answer("Это сообщение уже неактуально.", reply_markup=start_keyboard)
+        return
+    preset = presets.get(int(callback.data.removeprefix(STYLE_PRESET_PREFIX)))
+    if preset is None:
+        await callback.message.answer("Этого стиля больше нет. Выберите другой или пришлите свою картинку.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    path = save_image(files_dir, session_id, "Фон", load_image(str(preset.background)))
+    # The waiting state is cleared last: if saving stops halfway, the button still works.
+    await db.save_artifact(session_id, STYLE, preset.style, model=f"preset:{preset.number}")
+    await db.save_artifact(session_id, BACKGROUND, str(path), model=f"preset:{preset.number}")
+    await db.save_artifact(session_id, STYLE_REF, "", model="user")
+    await db.save_artifact(session_id, STYLE_PRESET, str(preset.number), model="user")
+    await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
+    await db.set_waiting_for(session_id, None)
+    await callback.message.answer(f"Выбран стиль {preset.number}.")
+    await run_slides(callback.message, db, pipeline, files_dir, session_id)
 
 
 @router.callback_query(F.data == BACKGROUND_ACCEPT)
@@ -1484,7 +1542,7 @@ async def cmd_cancel(message: Message, db: Database) -> None:
 
 @router.message(F.text)
 async def on_answer(
-    message: Message, db: Database, bank: QuestionBank, pipeline: Pipeline, files_dir: Path
+    message: Message, db: Database, bank: QuestionBank, pipeline: Pipeline, files_dir: Path, presets: PresetStore
 ) -> None:
     session_id = await db.get_active_session(message.from_user.id)
     if session_id is None:
@@ -1495,7 +1553,11 @@ async def on_answer(
         await message.answer("Пришлите исправленный план файлом .txt.")
         return
     if waiting_for == WAIT_STYLE_REF:
-        await message.answer("Пришлите картинку-референс или нажмите «Пропустить».", reply_markup=style_ref_keyboard)
+        if presets.load():
+            text = "Выберите стиль кнопкой под картинкой выше, пришлите картинку-референс или нажмите «Пропустить»."
+        else:
+            text = "Пришлите картинку-референс или нажмите «Пропустить»."
+        await message.answer(text, reply_markup=style_ref_keyboard)
         return
     caption_for = waiting_number(waiting_for, WAIT_CAPTION_PREFIX)
     if caption_for is not None:
@@ -1510,7 +1572,8 @@ async def on_answer(
         image = UserImage.from_json(await db.get_artifact(session_id, user_image_kind(caption_for)))
         image = UserImage(image.path, image.width, image.height, caption)
         await db.save_artifact(session_id, user_image_kind(caption_for), image.to_json(), model="user")
-        await show_slide_images(message, db, session_id, "Подпись сохранена. Можно выбрать следующий слайд.")
+        text = "Подпись сохранена. Можно выбрать следующий слайд."
+        await show_slide_images(message, db, presets, session_id, text)
         return
     photo_for = waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX)
     if photo_for is not None:
@@ -1518,7 +1581,7 @@ async def on_answer(
         return
     if waiting_for == WAIT_SLIDE_IMAGES:
         text = "Нажмите номер слайда, чтобы добавить фото, или кнопку внизу, чтобы продолжить."
-        await show_slide_images(message, db, session_id, text)
+        await show_slide_images(message, db, presets, session_id, text)
         return
     if waiting_for == WAIT_BACKGROUND_COMMENT:
         await db.save_artifact(session_id, BACKGROUND_COMMENT, message.text.strip(), model="user")

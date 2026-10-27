@@ -6,5 +6,6 @@ __pycache__
 .env
 data
 prompts
+presets
 snapshots
 scripts
