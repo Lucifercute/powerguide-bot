@@ -25,3 +25,4 @@ snapshots/
 
 # Server address and SSH key path (public repository)
 scripts/server.sh
+.DS_Store

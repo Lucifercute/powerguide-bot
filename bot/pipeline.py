@@ -96,12 +96,6 @@ def user_image_failed_kind(number: int) -> str:
     return f"user_image_failed_{number:02d}"
 
 
-def plan_slide_numbers(plan: str) -> list[int]:
-    """Slide numbers of the plan («СЛАЙД N» lines), in order, without repeats."""
-    numbers = [int(n) for n in _PLAN_SLIDE.findall(plan)]
-    return list(dict.fromkeys(numbers))
-
-
 def text_check_kind(number: int) -> str:
     """Artifact kind of slide N's text check: JSON list of [expected, found] pairs, [] = no issues."""
     return f"text_check_{number:02d}"
@@ -119,7 +113,6 @@ SLIDE_REFERENCE_PROMPT = "07a_slide_reference"
 USER_IMAGES_PROMPT = "06a_user_images"  # added to 06 when the user attached pictures
 USER_IMAGE_AREA_PROMPT = "07b_user_image_area"  # added to 07 for a slide with the user's picture
 NO_USER_IMAGE_PROMPT = "07c_no_user_image"  # added to 07 when the area didn't come out: draw without it
-_PLAN_SLIDE = re.compile(r"^[\s#*_]*СЛАЙД\s+(\d+)", re.MULTILINE | re.IGNORECASE)
 MAX_SLIDES = 10  # every slide is a paid image request
 _DESCRIPTION_HEADER = re.compile(r"^[\s#*_«\"]*Изображение\s+(\d+)\b", re.MULTILINE)
 
@@ -298,7 +291,7 @@ def build_slide_prompt(template: str, number: int, description: str, style: str,
 
 def strip_review_request(plan: str) -> str:
     """Prompt 03-1 ends the plan with "Проверьте план и напишите, что поправить…".
-    In the bot edits are made by sending the file back, so that line would mislead."""
+    In the bot each slide is edited with its own button, so that line would mislead."""
     lines = plan.rstrip().splitlines()
     if lines and lines[-1].strip().strip('"«»').startswith("Проверьте план"):
         lines.pop()

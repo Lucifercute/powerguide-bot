@@ -57,7 +57,6 @@ from bot.pipeline import (
     parse_aspect_ratio,
     search_declined,
     slide_kind,
-    plan_slide_numbers,
     slide_marked_kind,
     slide_prompt_kind,
     split_descriptions,
@@ -65,6 +64,7 @@ from bot.pipeline import (
     user_image_failed_kind,
     user_image_kind,
 )
+from bot.plan import SLIDE_TYPES, SlideFormatError, missing_data, parse_slide_edit, plan_slides, replace_slide
 from bot.presets import Preset, PresetStore
 from bot.sources import (
     BINARY_TYPES,
@@ -86,8 +86,6 @@ router = Router()
 NEW_PRESENTATION = "new_presentation"
 RETRY_STEP = "retry_step"
 PLAN_ACCEPT = "plan_accept"
-PLAN_EDIT = "plan_edit"
-MAX_PLAN_FILE_BYTES = 200_000
 WAIT_DESCRIPTION = "description"  # sessions.waiting_for while the bot waits for the free-form description
 WAIT_SOURCES = "source_files"  # sessions.waiting_for while the bot collects source files
 SOURCES_DONE = "sources_done"  # callback, and the artifact kind that marks the files step as done
@@ -126,12 +124,7 @@ retry_keyboard = InlineKeyboardMarkup(
 )
 
 plan_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Принять", callback_data=PLAN_ACCEPT),
-            InlineKeyboardButton(text="Внести правки", callback_data=PLAN_EDIT),
-        ]
-    ]
+    inline_keyboard=[[InlineKeyboardButton(text="Принять план", callback_data=PLAN_ACCEPT)]]
 )
 
 summary_keyboard = InlineKeyboardMarkup(
@@ -238,19 +231,27 @@ BG_COMMENT = "comment"  # «Доработать» pressed, waiting for the comm
 BG_PENDING = "pending"  # the second background is being drawn, or drawing it failed
 BG_CHOICE = "choice"  # both backgrounds shown, waiting for «Вариант 1» / «Вариант 2»
 BG_ACCEPTED = "accepted"
-# The user's own pictures for slides, collected after the plan is accepted:
-WAIT_SLIDE_IMAGES = "slide_images"  # sessions.waiting_for while the slide buttons are shown
+# The plan is shown slide by slide; under each slide its text can be edited and the user's own
+# picture added, one per slide. sessions.waiting_for is None while the plan just waits for buttons.
+SLIDE_EDIT_PREFIX = "slide_edit:"  # + N: «Исправить» under slide N; also waiting_for while its text is awaited
 WAIT_SLIDE_PHOTO_PREFIX = "slide_photo:"  # + N: waiting for the photo for slide N
 WAIT_CAPTION_PREFIX = "photo_caption:"  # + N: waiting for the caption of slide N's photo
-SLIDE_IMAGE_PREFIX = "slide_image:"  # + N: the «Слайд N» button
-SLIDE_IMAGES_DONE = "slide_images_done"  # callback, and the artifact kind that marks the step as done
+SLIDE_IMAGE_PREFIX = "slide_image:"  # + N: «Добавить изображение» / «Заменить» under slide N
+SLIDE_IMAGE_DELETE_PREFIX = "slide_image_delete:"  # + N: «Удалить» under slide N
+SLIDE_ACTION_CANCEL = "slide_action_cancel"  # «Отмена» while a slide's text or photo is awaited
+SLIDE_IMAGES_DONE = "slide_images_done"  # artifact kind: the plan is accepted
+PLAN_MESSAGES = "plan_messages"  # artifact kind: JSON {slide number: id of its message}, to update them
 CAPTION_SKIP = "caption_skip"
-SLIDE_IMAGES_REQUEST = (
-    "План принят. Если хотите вставить свои изображения на слайды, нажмите номер слайда и пришлите фото — "
-    "по одному на слайд. Изображение будет вставлено без изменений."
+PLAN_INTRO = (
+    "Каждый слайд — отдельным сообщением. Под слайдом можно исправить его текст или добавить своё "
+    "изображение (одно на слайд, вставляется без изменений). Когда всё готово — «Принять план» в конце."
 )
+PLAN_REMINDER = "Нажмите кнопку под нужным слайдом или «Принять план»."
 caption_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="Продолжить без подписи", callback_data=CAPTION_SKIP)]]
+)
+slide_cancel_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data=SLIDE_ACTION_CANCEL)]]
 )
 
 STYLE_REF_REQUEST = (
@@ -597,22 +598,39 @@ async def run_pipeline(
 
             await db.save_artifact(session_id, step.kind, result, model)
 
-        await show_plan(message, await db.get_artifact(session_id, PLAN.kind))
+        await show_plan(message, db, session_id)
     finally:
         _running.discard(session_id)
 
 
-def slide_images_keyboard(numbers: list[int], with_image: set[int]) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            text=f"✓ Слайд {n}" if n in with_image else f"Слайд {n}", callback_data=f"{SLIDE_IMAGE_PREFIX}{n}"
+def slide_keyboard(number: int, has_image: bool) -> InlineKeyboardMarkup:
+    """«Исправить» and the picture buttons under slide N; slides past MAX_SLIDES are not drawn,
+    so they get no picture buttons."""
+    rows = [[InlineKeyboardButton(text="✏️ Исправить", callback_data=f"{SLIDE_EDIT_PREFIX}{number}")]]
+    if has_image:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🔄 Заменить изображение", callback_data=f"{SLIDE_IMAGE_PREFIX}{number}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"{SLIDE_IMAGE_DELETE_PREFIX}{number}"),
+            ]
         )
-        for n in numbers
-    ]
-    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    done = "Готово" if with_image else "Продолжить без фото"
-    rows.append([InlineKeyboardButton(text=done, callback_data=SLIDE_IMAGES_DONE)])
+    elif number <= MAX_SLIDES:
+        rows.append(
+            [InlineKeyboardButton(text="🖼 Добавить изображение", callback_data=f"{SLIDE_IMAGE_PREFIX}{number}")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def slide_card(number: int, text: str, missing: list[str], image: UserImage | None) -> str:
+    """Message of one plan slide: its text, the missing-data notes, whether a picture is attached."""
+    body = re.sub(r"^(\s*)(ЗАГОЛОВОК|ТИП|СОДЕРЖАНИЕ):", r"\1<b>\2:</b>", escape(text), flags=re.MULTILINE)
+    parts = [f"<b>СЛАЙД {number}</b>\n{body}"]
+    if missing:
+        parts.append("⚠️ <b>Не хватает данных:</b>\n" + "\n".join(f"• {escape(note)}" for note in missing))
+    if image:
+        caption = f" с подписью «{escape(image.caption)}»" if image.caption else ""
+        parts.append(f"📎 Изображение добавлено{caption}")
+    return "\n\n".join(parts)
 
 
 async def load_user_images(db: Database, session_id: int) -> dict[int, UserImage]:
@@ -623,19 +641,6 @@ async def load_user_images(db: Database, session_id: int) -> dict[int, UserImage
         if user_image_kind(number) in artifacts:
             images[number] = UserImage.from_json(artifacts[user_image_kind(number)])
     return images
-
-
-async def show_slide_images(
-    message: Message, db: Database, presets: PresetStore, session_id: int, text: str
-) -> None:
-    """The «Слайд N» buttons; a plan without «СЛАЙД N» lines goes straight to the style reference."""
-    numbers = plan_slide_numbers(await db.get_artifact(session_id, PLAN.kind) or "")[:MAX_SLIDES]
-    if not numbers:
-        await finish_slide_images(message, db, presets, session_id)
-        return
-    await db.set_waiting_for(session_id, WAIT_SLIDE_IMAGES)
-    with_image = set(await load_user_images(db, session_id))
-    await message.answer(text, reply_markup=slide_images_keyboard(numbers, with_image))
 
 
 async def finish_slide_images(message: Message, db: Database, presets: PresetStore, session_id: int) -> None:
@@ -669,82 +674,115 @@ def waiting_number(waiting_for: str | None, prefix: str) -> int | None:
     return None
 
 
-def in_slide_images_step(waiting_for: str | None) -> bool:
-    return waiting_for == WAIT_SLIDE_IMAGES or (
-        waiting_for is not None and waiting_for.startswith((WAIT_SLIDE_PHOTO_PREFIX, WAIT_CAPTION_PREFIX))
-    )
-
-
 async def receive_slide_photo(message: Message, db: Database, files_dir: Path, session_id: int, number: int) -> None:
-    """Save the photo for slide N (its Telegram caption is ignored) and ask for a caption."""
+    """Save the photo for slide N (its Telegram caption is ignored), replacing the previous one,
+    and ask for a caption."""
     photo = message.photo[-1]  # Telegram sends several sizes; the last one is the largest
     if (photo.file_size or 0) > MAX_IMAGE_BYTES:
         await message.answer("Фото слишком большое (больше 10 МБ). Пришлите поменьше.")
         return
     data = (await message.bot.download(photo)).read()
     path = save_image(files_dir, session_id, f"Фото_слайд_{number:02d}", Image(data, "image/jpeg"))
+    replaced = await db.get_artifact(session_id, user_image_kind(number)) is not None
     image = UserImage(str(path), photo.width, photo.height)
     await db.save_artifact(session_id, user_image_kind(number), image.to_json(), model="user")
     await db.set_waiting_for(session_id, f"{WAIT_CAPTION_PREFIX}{number}")
+    await update_slide_card(message, db, session_id, number)
     await message.answer(
-        f"Фото для слайда {number} получено. Если хотите добавить подпись, пришлите её следующим сообщением "
+        f"Фото для слайда {number} {'заменено' if replaced else 'получено'}. Если хотите добавить подпись, пришлите её следующим сообщением "
         f"(до {MAX_CAPTION_CHARS} символов).",
         reply_markup=caption_keyboard,
     )
 
 
-async def show_plan(message: Message, plan: str) -> None:
-    """Plan as text to read and as a file to edit; the buttons go on the file message."""
-    await message.answer(f"<b>{escape(PLAN.title)}</b>")
-    for chunk in split_message(markdown_to_telegram(plan)):
-        await message.answer(chunk)
-    await message.answer_document(
-        BufferedInputFile(plan.encode("utf-8"), filename=PLAN.filename),
-        caption="Если план устраивает — «Принять». Если нет — «Внести правки».",
-        reply_markup=plan_keyboard,
-    )
+async def receive_slide_edit(message: Message, db: Database, session_id: int, number: int) -> None:
+    """The user's edited text of slide N: checked, put into the plan, the slide's message redrawn."""
+    try:
+        text = parse_slide_edit(message.text, number)
+    except SlideFormatError as e:
+        await message.answer(
+            f"Не получилось сохранить слайд {number}: {e}\n\nИсправьте текст и пришлите ещё раз — "
+            "или нажмите «Отмена».",
+            reply_markup=slide_cancel_keyboard,
+        )
+        return
+    plan = await db.get_artifact(session_id, PLAN.kind)
+    await db.save_artifact(session_id, PLAN.kind, replace_slide(plan, number, text), model="user")
+    await db.set_waiting_for(session_id, None)
+    await update_slide_card(message, db, session_id, number)
+    await message.answer(f"Слайд {number} обновлён.")
 
 
-async def session_with_plan(callback: CallbackQuery, db: Database) -> int | None:
-    """Active session whose plan is waiting for «Принять» / «Внести правки»,
-    or None (stale button) after telling the user."""
-    session_id = await db.get_active_session(callback.from_user.id)
-    if (
-        session_id is None
-        or await db.get_artifact(session_id, PLAN.kind) is None
-        or await db.get_artifact(session_id, STYLE_REF) is not None  # plan already accepted
-        or await db.get_artifact(session_id, SLIDE_IMAGES_DONE) is not None  # plan already accepted
-        or await db.get_waiting_for(session_id) == WAIT_STYLE_REF
-        or in_slide_images_step(await db.get_waiting_for(session_id))
-    ):
-        await callback.message.answer("Этот план уже неактуален.", reply_markup=start_keyboard)
+async def show_plan(message: Message, db: Database, session_id: int) -> None:
+    """Each slide as its own message with its buttons, notes about the whole plan,
+    then «Принять план». A plan without «СЛАЙД N» lines is shown as is."""
+    plan = await db.get_artifact(session_id, PLAN.kind)
+    slides = plan_slides(plan)
+    if not slides:
+        for chunk in split_message(markdown_to_telegram(plan)):
+            await message.answer(chunk)
+        await message.answer("Если план устраивает — «Принять план».", reply_markup=plan_keyboard)
+        return
+    missing, general = missing_data(plan)
+    images = await load_user_images(db, session_id)
+    await message.answer(f"<b>{escape(PLAN.title)}</b>\n\n{PLAN_INTRO}")
+    ids = {}
+    for number, text in slides.items():
+        sent = await message.answer(
+            slide_card(number, text, missing.get(number, []), images.get(number)),
+            reply_markup=slide_keyboard(number, number in images),
+        )
+        ids[number] = sent.message_id
+    await db.save_artifact(session_id, PLAN_MESSAGES, json.dumps(ids), model="user")
+    if general:
+        notes = "\n".join(f"• {escape(note)}" for note in general)
+        await message.answer(f"⚠️ <b>Обратите внимание</b>\n\n{notes}")
+    await message.answer("Если план устраивает — «Принять план».", reply_markup=plan_keyboard)
+
+
+async def plan_messages(db: Database, session_id: int) -> dict[int, int]:
+    """Message ids of the plan slides by slide number."""
+    saved = await db.get_artifact(session_id, PLAN_MESSAGES)
+    return {int(number): message_id for number, message_id in json.loads(saved).items()} if saved else {}
+
+
+async def update_slide_card(message: Message, db: Database, session_id: int, number: int) -> None:
+    """Redraw slide N's message after its text or picture changed. If it can't be edited
+    (deleted by the user), the change is still saved; the reply about it is enough."""
+    message_id = (await plan_messages(db, session_id)).get(number)
+    plan = await db.get_artifact(session_id, PLAN.kind)
+    text = plan_slides(plan).get(number)
+    if message_id is None or text is None:
+        return
+    image = (await load_user_images(db, session_id)).get(number)
+    try:
+        await message.bot.edit_message_text(
+            slide_card(number, text, missing_data(plan)[0].get(number, []), image),
+            chat_id=message.chat.id,
+            message_id=message_id,
+            reply_markup=slide_keyboard(number, image is not None),
+        )
+    except TelegramBadRequest as e:
+        log.warning("Could not update the message of slide %d in session %d: %s", number, session_id, e)
+
+
+async def plan_session(db: Database, user_id: int) -> int | None:
+    """Active session whose plan is shown and not accepted yet."""
+    session_id = await db.get_active_session(user_id)
+    if session_id is None:
+        return None
+    artifacts = await db.get_artifacts(session_id)
+    if PLAN.kind not in artifacts or SLIDE_IMAGES_DONE in artifacts or STYLE_REF in artifacts:
         return None
     return session_id
 
 
-async def read_plan_file(message: Message) -> str | None:
-    """Text of an uploaded .txt plan, or None after telling the user what's wrong."""
-    doc = message.document
-    if not (doc.file_name or "").lower().endswith(".txt"):
-        await message.answer("Пришлите план файлом .txt.")
-        return None
-    if (doc.file_size or 0) > MAX_PLAN_FILE_BYTES:
-        await message.answer("Файл слишком большой для плана.")
-        return None
-    raw = (await message.bot.download(doc)).read()
-    for encoding in ("utf-8-sig", "cp1251"):  # Windows Notepad may still save in cp1251
-        try:
-            text = raw.decode(encoding).strip()
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        await message.answer("Не удалось прочитать файл. Сохраните его в кодировке UTF-8.")
-        return None
-    if not text:
-        await message.answer("Файл пустой. Пришлите исправленный план.")
-        return None
-    return text
+async def session_with_plan(callback: CallbackQuery, db: Database) -> int | None:
+    """plan_session for a button under the plan, or None (stale button) after telling the user."""
+    session_id = await plan_session(db, callback.from_user.id)
+    if session_id is None:
+        await callback.message.answer("Этот план уже неактуален.", reply_markup=start_keyboard)
+    return session_id
 
 
 def save_image(files_dir: Path, session_id: int, name: str, image: Image) -> Path:
@@ -1295,69 +1333,113 @@ async def on_edit_question(callback: CallbackQuery, db: Database, bank: Question
 
 @router.callback_query(F.data == PLAN_ACCEPT)
 async def on_plan_accept(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
+    """«Принять план»: the slide buttons go away, on to the style."""
     await ack(callback)
     session_id = await session_with_plan(callback, db)
     if session_id is None:
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await show_slide_images(callback.message, db, presets, session_id, SLIDE_IMAGES_REQUEST)
+    for message_id in (await plan_messages(db, session_id)).values():
+        with suppress(TelegramBadRequest):  # deleted by the user, or already without buttons
+            await callback.bot.edit_message_reply_markup(
+                chat_id=callback.message.chat.id, message_id=message_id, reply_markup=None
+            )
+    await callback.message.answer("План принят.")
+    await finish_slide_images(callback.message, db, presets, session_id)
+
+
+async def plan_slide(callback: CallbackQuery, db: Database, prefix: str) -> tuple[int, int, str] | None:
+    """(session, N, slide N's text) for a button under slide N, or None after telling the user."""
+    session_id = await session_with_plan(callback, db)
+    if session_id is None:
+        return None
+    number = int(callback.data.removeprefix(prefix))
+    text = plan_slides(await db.get_artifact(session_id, PLAN.kind)).get(number)
+    if text is None:
+        await callback.message.answer("Этого слайда уже нет в плане.")
+        return None
+    return session_id, number, text
+
+
+@router.callback_query(F.data.startswith(SLIDE_EDIT_PREFIX))
+async def on_slide_edit(callback: CallbackQuery, db: Database) -> None:
+    """«Исправить»: the slide's text to copy, edit and send back."""
+    await ack(callback)
+    found = await plan_slide(callback, db, SLIDE_EDIT_PREFIX)
+    if found is None:
+        return
+    session_id, number, text = found
+    await db.set_waiting_for(session_id, f"{SLIDE_EDIT_PREFIX}{number}")
+    await callback.message.answer(
+        f"Исправляем слайд {number}. Нажмите на текст ниже, чтобы скопировать его, исправьте и пришлите "
+        "следующим сообщением.\n\n"
+        "⚠️ Сохраните структуру: строки ЗАГОЛОВОК, ТИП и СОДЕРЖАНИЕ в этом порядке. "
+        f"ТИП — один из: {', '.join(SLIDE_TYPES)}. У схемы в содержании нужны «Блоки:» и «Связи:».\n\n"
+        f"<pre>{escape(text)}</pre>",
+        reply_markup=slide_cancel_keyboard,
+    )
 
 
 @router.callback_query(F.data.startswith(SLIDE_IMAGE_PREFIX))
 async def on_slide_image(callback: CallbackQuery, db: Database) -> None:
-    """«Слайд N»: wait for the photo for that slide."""
+    """«Добавить изображение» / «Заменить изображение»: wait for the photo for that slide."""
     await ack(callback)
-    session_id = await db.get_active_session(callback.from_user.id)
+    found = await plan_slide(callback, db, SLIDE_IMAGE_PREFIX)
+    if found is None:
+        return
+    session_id, number, _ = found
+    await db.set_waiting_for(session_id, f"{WAIT_SLIDE_PHOTO_PREFIX}{number}")
+    if await db.get_artifact(session_id, user_image_kind(number)) is not None:
+        text = f"Пришлите новое фото для слайда {number} — оно заменит текущее."
+    else:
+        text = f"Пришлите фото для слайда {number}."
+    await callback.message.answer(text, reply_markup=slide_cancel_keyboard)
+
+
+@router.callback_query(F.data.startswith(SLIDE_IMAGE_DELETE_PREFIX))
+async def on_slide_image_delete(callback: CallbackQuery, db: Database) -> None:
+    await ack(callback)
+    found = await plan_slide(callback, db, SLIDE_IMAGE_DELETE_PREFIX)
+    if found is None:
+        return
+    session_id, number, _ = found
+    if await db.get_artifact(session_id, user_image_kind(number)) is None:
+        await callback.message.answer(f"У слайда {number} нет изображения.")
+        return
+    await db.delete_artifact(session_id, user_image_kind(number))
+    waiting_for = await db.get_waiting_for(session_id)
+    if number in (waiting_number(waiting_for, WAIT_CAPTION_PREFIX), waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX)):
+        await db.set_waiting_for(session_id, None)
+    await update_slide_card(callback.message, db, session_id, number)
+    await callback.message.answer(f"Изображение со слайда {number} удалено.")
+
+
+@router.callback_query(F.data == SLIDE_ACTION_CANCEL)
+async def on_slide_action_cancel(callback: CallbackQuery, db: Database) -> None:
+    """«Отмена» while a slide's new text or photo is awaited."""
+    await ack(callback)
+    session_id = await plan_session(db, callback.from_user.id)
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
-    if not in_slide_images_step(waiting_for):  # while a caption is awaited, another slide means "no caption"
+    if not (waiting_for and waiting_for.startswith((SLIDE_EDIT_PREFIX, WAIT_SLIDE_PHOTO_PREFIX))):
         await callback.message.answer("Эта кнопка уже неактуальна.")
         return
-    number = int(callback.data.removeprefix(SLIDE_IMAGE_PREFIX))
-    if await db.get_artifact(session_id, user_image_kind(number)) is not None:
-        await callback.message.answer("Фото для этого слайда уже добавлено.")
-        return
-    await db.set_waiting_for(session_id, f"{WAIT_SLIDE_PHOTO_PREFIX}{number}")
-    await callback.message.answer(f"Пришлите фото для слайда {number}.")
+    await db.set_waiting_for(session_id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"Отменено. {PLAN_REMINDER}")
 
 
 @router.callback_query(F.data == CAPTION_SKIP)
-async def on_caption_skip(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
+async def on_caption_skip(callback: CallbackQuery, db: Database) -> None:
     await ack(callback)
-    session_id = await db.get_active_session(callback.from_user.id)
+    session_id = await plan_session(db, callback.from_user.id)
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
     number = waiting_number(waiting_for, WAIT_CAPTION_PREFIX)
     if number is None:
         await callback.message.answer("Эта кнопка уже неактуальна.")
         return
+    await db.set_waiting_for(session_id, None)
     await callback.message.edit_reply_markup(reply_markup=None)
-    text = f"Фото для слайда {number} добавлено без подписи. Можно выбрать следующий слайд."
-    await show_slide_images(callback.message, db, presets, session_id, text)
-
-
-@router.callback_query(F.data == SLIDE_IMAGES_DONE)
-async def on_slide_images_done(callback: CallbackQuery, db: Database, presets: PresetStore) -> None:
-    """«Готово» / «Продолжить без фото»: go on to the style reference."""
-    await ack(callback)
-    session_id = await db.get_active_session(callback.from_user.id)
-    waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
-    if not in_slide_images_step(waiting_for):
-        await callback.message.answer("Эта кнопка уже неактуальна.")
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await finish_slide_images(callback.message, db, presets, session_id)
-
-
-@router.callback_query(F.data == PLAN_EDIT)
-async def on_plan_edit(callback: CallbackQuery, db: Database) -> None:
-    await ack(callback)
-    session_id = await session_with_plan(callback, db)
-    if session_id is None:
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await db.set_waiting_for(session_id, PLAN_EDIT)
-    await callback.message.answer(
-        "Скачайте файл с планом, исправьте в нём то, что нужно, и пришлите файл обратно (.txt)."
-    )
+    await callback.message.answer(f"Фото для слайда {number} добавлено без подписи.")
 
 
 @router.callback_query(F.data == STYLE_REF_SKIP)
@@ -1481,13 +1563,21 @@ async def on_photo(message: Message, db: Database, pipeline: Pipeline, files_dir
     if number is not None:
         await receive_slide_photo(message, db, files_dir, session_id, number)
         return
-    if waiting_for == WAIT_SLIDE_IMAGES:
-        await message.answer("Сначала нажмите номер слайда, для которого это фото.")
-        return
     if waiting_number(waiting_for, WAIT_CAPTION_PREFIX) is not None:
         await message.answer(
             "Пришлите подпись текстом или нажмите «Продолжить без подписи».", reply_markup=caption_keyboard
         )
+        return
+    edit_for = waiting_number(waiting_for, SLIDE_EDIT_PREFIX)
+    if edit_for is not None:
+        await message.answer(
+            f"Сейчас я жду исправленный текст слайда {edit_for}. Чтобы добавить фото, нажмите «Отмена», "
+            "а потом «Добавить изображение» под слайдом.",
+            reply_markup=slide_cancel_keyboard,
+        )
+        return
+    if waiting_for is None and await plan_session(db, message.from_user.id) is not None:
+        await message.answer("Чтобы добавить фото, нажмите «Добавить изображение» под нужным слайдом.")
         return
     if waiting_for != WAIT_STYLE_REF:
         await message.answer(unexpected_file_text(waiting_for))
@@ -1502,7 +1592,7 @@ async def on_document(
 ) -> None:
     session_id = await db.get_active_session(message.from_user.id)
     waiting_for = await db.get_waiting_for(session_id) if session_id is not None else None
-    if in_slide_images_step(waiting_for):
+    if waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX) is not None:
         await message.answer("Пришлите изображение как фото, а не файлом.")
         return
     if waiting_for == WAIT_STYLE_REF:
@@ -1518,16 +1608,7 @@ async def on_document(
         name = document.file_name or f"Файл_{document.file_unique_id}"
         await receive_source_file(message, db, files_dir, session_id, document, name, document.mime_type, soffice)
         return
-    if waiting_for != PLAN_EDIT:
-        await message.answer(unexpected_file_text(waiting_for))
-        return
-    plan = await read_plan_file(message)
-    if plan is None:
-        return
-    await db.save_artifact(session_id, PLAN.kind, plan, model="user")
-    await db.set_waiting_for(session_id, None)
-    await message.answer("Исправленный план сохранён.")
-    await show_plan(message, plan)
+    await message.answer(unexpected_file_text(waiting_for))
 
 
 @router.message(Command("cancel"))
@@ -1549,8 +1630,9 @@ async def on_answer(
         await message.answer("Нажми «Новая презентация», чтобы начать.", reply_markup=start_keyboard)
         return
     waiting_for = await db.get_waiting_for(session_id)
-    if waiting_for == PLAN_EDIT:
-        await message.answer("Пришлите исправленный план файлом .txt.")
+    edit_for = waiting_number(waiting_for, SLIDE_EDIT_PREFIX)
+    if edit_for is not None:
+        await receive_slide_edit(message, db, session_id, edit_for)
         return
     if waiting_for == WAIT_STYLE_REF:
         if presets.load():
@@ -1572,16 +1654,13 @@ async def on_answer(
         image = UserImage.from_json(await db.get_artifact(session_id, user_image_kind(caption_for)))
         image = UserImage(image.path, image.width, image.height, caption)
         await db.save_artifact(session_id, user_image_kind(caption_for), image.to_json(), model="user")
-        text = "Подпись сохранена. Можно выбрать следующий слайд."
-        await show_slide_images(message, db, presets, session_id, text)
+        await db.set_waiting_for(session_id, None)
+        await update_slide_card(message, db, session_id, caption_for)
+        await message.answer("Подпись сохранена.")
         return
     photo_for = waiting_number(waiting_for, WAIT_SLIDE_PHOTO_PREFIX)
     if photo_for is not None:
-        await message.answer(f"Пришлите фото для слайда {photo_for}.")
-        return
-    if waiting_for == WAIT_SLIDE_IMAGES:
-        text = "Нажмите номер слайда, чтобы добавить фото, или кнопку внизу, чтобы продолжить."
-        await show_slide_images(message, db, presets, session_id, text)
+        await message.answer(f"Пришлите фото для слайда {photo_for}.", reply_markup=slide_cancel_keyboard)
         return
     if waiting_for == WAIT_BACKGROUND_COMMENT:
         await db.save_artifact(session_id, BACKGROUND_COMMENT, message.text.strip(), model="user")
@@ -1626,7 +1705,7 @@ async def on_answer(
         await run_design(message, db, pipeline, files_dir, session_id)
         return
     if PLAN.kind in artifacts:
-        await message.answer("Посмотрите план выше и нажмите кнопку:", reply_markup=plan_keyboard)
+        await message.answer(PLAN_REMINDER, reply_markup=plan_keyboard)
         return
     survey = bank.load()
     stage = await survey_stage(db, survey, session_id)
