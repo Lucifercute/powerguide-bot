@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 # «Текст на изображении: "…"; "…"» — the line of a 06 description with every caption of the slide.
 _TEXT_LINE = re.compile(r"^[\s*_]*Текст на изображении[\s*_]*:[\s*_]*(.*)$", re.MULTILINE | re.IGNORECASE)
-_WORD = re.compile(r"[^\W_]+")  # a run of letters and digits; punctuation and quotes are not compared
+_WORD = re.compile(r"\d+(?:[.,]\d+)+|[^\W_]+")  # Keep decimal separators: 1.5 and 15 must not match.
 # Latin letters that look like Cyrillic ones (after lowercasing): the model may read «ОР» as "OP".
 _LOOKALIKES = str.maketrans("aeopcxykmthb", "аеорсхукмтнв")
 
@@ -46,7 +46,10 @@ def compare(expected: str, found: str) -> list[TextIssue]:
         if op == "equal":
             continue
         # The same letters split or joined differently, e.g. a word broken across lines: not a typo.
-        if "".join(want_keys[i1:i2]) == "".join(got_keys[j1:j2]):
+        if (
+            all(key.isalpha() for key in want_keys[i1:i2] + got_keys[j1:j2])
+            and "".join(want_keys[i1:i2]) == "".join(got_keys[j1:j2])
+        ):
             continue
         issues.append(
             TextIssue(

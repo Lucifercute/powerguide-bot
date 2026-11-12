@@ -94,6 +94,12 @@ async def convert_to_pdf(soffice: str, path: Path) -> Path:
         )
         try:
             _, stderr = await asyncio.wait_for(process.communicate(), CONVERT_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            pdf.unlink(missing_ok=True)
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()

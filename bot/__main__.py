@@ -13,6 +13,7 @@ from bot.pipeline import Pipeline
 from bot.presets import PresetStore
 from bot.questions import QuestionBank
 from bot.search import WebSearch
+from bot.editable.service import EditableService
 
 
 async def main() -> None:
@@ -38,6 +39,10 @@ async def main() -> None:
         prompts_dir=config.prompts_dir,
         max_queries=config.search_max_queries,
     )
+    pipeline.editable_enabled = config.editable_pptx_enabled
+    pipeline.editable_service = EditableService(pipeline.llm, pipeline.images, config.prompts_dir)
+    logging.info('Editable PPTX choice enabled: %s; database: %s',
+                 config.editable_pptx_enabled, config.db_path.resolve())
     # Values passed here are injected into handlers by parameter name (db, bank, pipeline, files_dir, soffice, presets).
     dp = Dispatcher(
         db=db,

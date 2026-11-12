@@ -22,6 +22,7 @@ class Config:
     image_models: list[str]
     files_dir: Path
     libreoffice_path: str | None  # None: Word/PowerPoint files are read as text only
+    editable_pptx_enabled: bool = False
 
 
 def _required(name: str) -> str:
@@ -61,4 +62,5 @@ def load_config() -> Config:
         image_models=_split(image_models),
         files_dir=Path(os.getenv("FILES_DIR", "data/sessions")),
         libreoffice_path=os.getenv("LIBREOFFICE_PATH") or _find_libreoffice(),
+        editable_pptx_enabled=os.getenv("EDITABLE_PPTX_ENABLED", "0").lower() in {"1", "true", "yes"},
     )

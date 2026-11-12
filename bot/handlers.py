@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import mimetypes
 import re
 from contextlib import suppress
 from html import escape
@@ -22,7 +21,6 @@ from aiogram.types import (
 )
 
 from bot.db import Database
-from bot.export import build_pdf
 from bot.llm import Image, LLMError
 from bot.pipeline import (
     ASKED_QUESTIONS,
@@ -38,10 +36,8 @@ from bot.pipeline import (
     BACKGROUND_FIELDS,
     DATA,
     DESCRIPTION,
-    DESCRIPTIONS,
     MAX_SLIDES,
     PLAN,
-    RATIO_ANSWER_KEY,
     RESEARCH_ANSWER_KEY,
     SKIPPED_ANSWER,
     SOURCES,
@@ -54,14 +50,7 @@ from bot.pipeline import (
     TZ,
     BackgroundFields,
     Pipeline,
-    parse_aspect_ratio,
     search_declined,
-    slide_kind,
-    slide_marked_kind,
-    slide_prompt_kind,
-    split_descriptions,
-    text_check_kind,
-    user_image_failed_kind,
     user_image_kind,
 )
 from bot.plan import SLIDE_TYPES, SlideFormatError, missing_data, parse_slide_edit, plan_slides, replace_slide
@@ -77,11 +66,15 @@ from bot.sources import (
     extract_text,
 )
 from bot.questions import Question, QuestionBank, Survey
-from bot.textcheck import TextIssue
-from bot.user_images import MAX_CAPTION_CHARS, UserImage, find_area, marker_color, place_image
+from bot.user_images import MAX_CAPTION_CHARS, UserImage
+
+from bot.runtime import _running, load_user_images, save_image, load_image, session_ratio
+from bot.generation_modes import continue_generation, router as generation_modes_router
+from bot.jobs import session_locks
 
 log = logging.getLogger(__name__)
 router = Router()
+router.include_router(generation_modes_router)
 
 NEW_PRESENTATION = "new_presentation"
 RETRY_STEP = "retry_step"
@@ -106,13 +99,7 @@ BACKGROUND_REDRAW = "background_regenerate"
 BACKGROUND_PICK_PREFIX = "background_pick:"  # + "1" or "2": the background chosen after the change
 WAIT_BACKGROUND_COMMENT = "background_comment"  # sessions.waiting_for while the bot waits for the comment
 MAX_IMAGE_BYTES = 10_000_000
-# Slide requests running at the same time. 1 = one by one: the Vertex trial quota
-# answered 429 to 3 parallel requests, and retries only slowed things down.
-SLIDE_CONCURRENCY = 1
-TEXT_CHECK_CONCURRENCY = 3  # text requests: Vertex has no trouble with a few at once
-TELEGRAM_ALBUM_LIMIT = 10
 MAX_PRESETS_SHOWN = 10  # one photo message each: more would flood the chat
-PDF_FILENAME = "Презентация.pdf"
 IMAGE_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 TELEGRAM_LIMIT = 4096
 
@@ -267,7 +254,7 @@ STYLE_CHOICE_REST = (
 
 # Sessions whose pipeline is running right now: protects from double-clicks and
 # from extra messages sent while the model is still working.
-_running: set[int] = set()
+
 
 
 def markdown_to_telegram(text: str) -> str:
@@ -402,7 +389,7 @@ async def resume_survey(
     elif stage == STAGE_ANALYSIS and session_id in _running:
         await message.answer("Работа уже идёт, подождите немного.")
     elif stage == STAGE_ANALYSIS:
-        await message.answer(ANALYSIS_FAILED, reply_markup=start_keyboard)
+        await message.answer(ANALYSIS_FAILED, reply_markup=retry_keyboard)
     else:
         await message.answer(OUTDATED_SESSION, reply_markup=start_keyboard)
 
@@ -412,41 +399,35 @@ async def ask_source_files(message: Message, db: Database, session_id: int) -> N
     await message.answer(SOURCES_REQUEST, reply_markup=sources_skip_keyboard)
 
 
+@_running.handle_cancellation
 async def run_analysis(
     message: Message, db: Database, bank: QuestionBank, pipeline: Pipeline, session_id: int
 ) -> None:
     """Find answers to the survey in the description and source data, then ask the rest one by one.
     If everything is answered, the pipeline starts right away."""
-    if session_id in _running:
-        await message.answer("Работа уже идёт, подождите немного.")
-        return
-    _running.add(session_id)
+    await message.answer("Изучаю ваше описание и исходные данные…")
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    survey = bank.load()
+    artifacts = await db.get_artifacts(session_id)
+    sources = await db.get_source_files(session_id)
     try:
-        await message.answer("Изучаю ваше описание и исходные данные…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        survey = bank.load()
-        artifacts = await db.get_artifacts(session_id)
-        sources = await db.get_source_files(session_id)
-        try:
-            found, model = await pipeline.analyze_survey(
-                survey, artifacts.get(DESCRIPTION, ""), artifacts.get(SOURCES_NOTE), sources
-            )
-        except LLMError as e:
-            log.error("Survey analysis failed for session %d: %s", session_id, e)
-            await message.answer(ANALYSIS_FAILED, reply_markup=start_keyboard)
-            return
-        log.info("Survey analysis for session %d found answers to: %s", session_id, sorted(found))
-        for q in survey.questions:
-            if q.key in found:
-                await db.save_answer(session_id, q.key, q.text, found[q.key])
-        missing = [q.key for q in survey.questions if q.key not in found]
-        await db.save_artifact(session_id, ASKED_QUESTIONS, json.dumps(missing, ensure_ascii=False), model)
-        if missing:
-            await ask_next_question(message, db, bank, session_id)
-            return
-        await db.save_artifact(session_id, SURVEY_CONFIRMED, "", model="auto")
-    finally:
-        _running.discard(session_id)
+        found, model = await pipeline.analyze_survey(
+            survey, artifacts.get(DESCRIPTION, ""), artifacts.get(SOURCES_NOTE), sources
+        )
+    except LLMError as e:
+        log.error("Survey analysis failed for session %d: %s", session_id, e)
+        await message.answer(ANALYSIS_FAILED, reply_markup=retry_keyboard)
+        return
+    log.info("Survey analysis for session %d found answers to: %s", session_id, sorted(found))
+    for q in survey.questions:
+        if q.key in found:
+            await db.save_answer(session_id, q.key, q.text, found[q.key])
+    missing = [q.key for q in survey.questions if q.key not in found]
+    await db.save_artifact(session_id, ASKED_QUESTIONS, json.dumps(missing, ensure_ascii=False), model)
+    if missing:
+        await ask_next_question(message, db, bank, session_id)
+        return
+    await db.save_artifact(session_id, SURVEY_CONFIRMED, "", model="auto")
     await run_pipeline(message, db, bank, pipeline, session_id)
 
 
@@ -457,7 +438,8 @@ async def notice_links(message: Message) -> None:
 
 # Telegram delivers files sent together as separate updates handled concurrently;
 # the lock keeps the 10-file limit and the numbering exact.
-_source_files_lock = asyncio.Lock()
+_source_files_locks = session_locks()
+_user_locks = session_locks()
 
 
 async def receive_source_file(
@@ -487,7 +469,10 @@ async def receive_source_file(
     if (file.file_size or 0) > MAX_SOURCE_FILE_BYTES:
         await message.answer(f"Файл «{escape(name or 'фото')}» больше 20 МБ — такие Telegram не даёт боту скачать.")
         return
-    async with _source_files_lock:
+    async with _source_files_locks[session_id]:
+        if await db.get_waiting_for(session_id) != WAIT_SOURCES or not await db.is_active(session_id):
+            await message.answer("Приём файлов для этой презентации уже завершён.")
+            return
         count = len(await db.get_source_files(session_id))
         if count >= MAX_SOURCE_FILES:
             await message.answer(
@@ -552,6 +537,7 @@ async def _to_pdf(soffice: str, path: Path, name: str) -> Path | None:
     return pdf
 
 
+@_running.handle_cancellation
 async def run_pipeline(
     message: Message, db: Database, bank: QuestionBank, pipeline: Pipeline, session_id: int
 ) -> None:
@@ -560,47 +546,40 @@ async def run_pipeline(
     Intermediate results are not shown to the user. They are saved after each step,
     so after a failure the retry continues from the failed step instead of starting over.
     """
-    if session_id in _running:
-        await message.answer("Работа уже идёт, подождите немного.")
-        return
-    _running.add(session_id)
-    try:
-        survey = bank.load()
-        answers = await db.get_answers(session_id)
-        for number, step in enumerate(STEPS, start=1):
-            if await db.get_artifact(session_id, step.kind) is not None:
-                continue
-            await message.answer(f"Шаг {number} из {len(STEPS)}: {step.title.lower()}. Это может занять минуту…")
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    survey = bank.load()
+    answers = await db.get_answers(session_id)
+    for number, step in enumerate(STEPS, start=1):
+        if await db.get_artifact(session_id, step.kind) is not None:
+            continue
+        await message.answer(f"Шаг {number} из {len(STEPS)}: {step.title.lower()}. Это может занять минуту…")
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-            if step is DATA and await db.get_artifact(session_id, SOURCES) is None:
-                if search_declined(answers.get(RESEARCH_ANSWER_KEY)):
-                    # Empty sources: step 02 is told there is no internet access.
-                    log.info("Web search skipped for session %d: the user said it is not needed", session_id)
-                    await db.save_artifact(session_id, SOURCES, "")
-                else:
-                    await message.answer("Ищу информацию в открытых источниках…")
-                    tz = await db.get_artifact(session_id, TZ.kind)
-                    await db.save_artifact(session_id, SOURCES, await pipeline.find_sources(tz))
+        if step is DATA and await db.get_artifact(session_id, SOURCES) is None:
+            if search_declined(answers.get(RESEARCH_ANSWER_KEY)):
+                # Empty sources: step 02 is told there is no internet access.
+                log.info("Web search skipped for session %d: the user said it is not needed", session_id)
+                await db.save_artifact(session_id, SOURCES, "")
+            else:
+                await message.answer("Ищу информацию в открытых источниках…")
+                tz = await db.get_artifact(session_id, TZ.kind)
+                await db.save_artifact(session_id, SOURCES, await pipeline.find_sources(tz))
 
-            artifacts = await db.get_artifacts(session_id)
-            try:
-                sources = await db.get_source_files(session_id)
-                result, model = await pipeline.run_step(step, survey, answers, artifacts, sources)
-            except LLMError as e:
-                log.error("Step %s failed for session %d: %s", step.kind, session_id, e)
-                if e.quota_exceeded:
-                    text = "Лимит бесплатных запросов к нейросети исчерпан. Прогресс сохранён — попробуйте позже."
-                else:
-                    text = "Нейросеть сейчас не отвечает. Прогресс сохранён — попробуйте ещё раз."
-                await message.answer(text, reply_markup=retry_keyboard)
-                return
+        artifacts = await db.get_artifacts(session_id)
+        try:
+            sources = await db.get_source_files(session_id)
+            result, model = await pipeline.run_step(step, survey, answers, artifacts, sources)
+        except LLMError as e:
+            log.error("Step %s failed for session %d: %s", step.kind, session_id, e)
+            if e.quota_exceeded:
+                text = "Лимит бесплатных запросов к нейросети исчерпан. Прогресс сохранён — попробуйте позже."
+            else:
+                text = "Нейросеть сейчас не отвечает. Прогресс сохранён — попробуйте ещё раз."
+            await message.answer(text, reply_markup=retry_keyboard)
+            return
 
-            await db.save_artifact(session_id, step.kind, result, model)
+        await db.save_artifact(session_id, step.kind, result, model)
 
-        await show_plan(message, db, session_id)
-    finally:
-        _running.discard(session_id)
+    await show_plan(message, db, session_id)
 
 
 def slide_keyboard(number: int, has_image: bool) -> InlineKeyboardMarkup:
@@ -631,16 +610,6 @@ def slide_card(number: int, text: str, missing: list[str], image: UserImage | No
         caption = f" с подписью «{escape(image.caption)}»" if image.caption else ""
         parts.append(f"📎 Изображение добавлено{caption}")
     return "\n\n".join(parts)
-
-
-async def load_user_images(db: Database, session_id: int) -> dict[int, UserImage]:
-    """The user's pictures by slide number."""
-    artifacts = await db.get_artifacts(session_id)
-    images = {}
-    for number in range(1, MAX_SLIDES + 1):
-        if user_image_kind(number) in artifacts:
-            images[number] = UserImage.from_json(artifacts[user_image_kind(number)])
-    return images
 
 
 async def finish_slide_images(message: Message, db: Database, presets: PresetStore, session_id: int) -> None:
@@ -785,23 +754,6 @@ async def session_with_plan(callback: CallbackQuery, db: Database) -> int | None
     return session_id
 
 
-def save_image(files_dir: Path, session_id: int, name: str, image: Image) -> Path:
-    folder = files_dir / str(session_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{name}{IMAGE_EXTENSIONS.get(image.mime_type, '.png')}"
-    path.write_bytes(image.data)
-    return path
-
-
-def load_image(path: str) -> Image:
-    file = Path(path)
-    return Image(file.read_bytes(), mimetypes.guess_type(file.name)[0] or "image/png")
-
-
-async def session_ratio(db: Database, session_id: int) -> str:
-    return parse_aspect_ratio((await db.get_answers(session_id)).get(RATIO_ANSWER_KEY))
-
-
 async def receive_style_ref(
     message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int, file, mime_type: str
 ) -> None:
@@ -817,41 +769,35 @@ async def receive_style_ref(
     await run_design(message, db, pipeline, files_dir, session_id)
 
 
+@_running.handle_cancellation
 async def run_design(message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int) -> None:
     """Generate the first background (prompt 04) and show it with «Принять» / «Доработать» /
     «Нарисовать заново». The prompt fields are filled from the ТЗ once and reused on retry."""
-    if session_id in _running:
-        await message.answer("Работа уже идёт, подождите немного.")
-        return
-    _running.add(session_id)
+    artifacts = await db.get_artifacts(session_id)
+    reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
+    await message.answer("Рисую фон для слайдов. Это может занять до минуты…")
+    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
     try:
-        artifacts = await db.get_artifacts(session_id)
-        reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
-        await message.answer("Рисую фон для слайдов. Это может занять до минуты…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-        try:
-            if BACKGROUND_FIELDS in artifacts:
-                fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
-            else:
-                fields = await pipeline.background_fields(artifacts[TZ.kind], has_reference=reference is not None)
-                await db.save_artifact(session_id, BACKGROUND_FIELDS, fields.model_dump_json())
-            image, model = await pipeline.background(fields, await session_ratio(db, session_id), reference)
-        except LLMError as e:
-            log.error("Background failed for session %d: %s", session_id, e)
-            await message.answer(
-                "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз.",
-                reply_markup=retry_keyboard,
-            )
-            return
-        path = save_image(files_dir, session_id, "Фон", image)
-        await db.save_artifact(session_id, BACKGROUND, str(path), model)
-        await message.answer_photo(
-            BufferedInputFile(image.data, filename=path.name),
-            caption=BACKGROUND_CAPTION,
-            reply_markup=background_keyboard,
+        if BACKGROUND_FIELDS in artifacts:
+            fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
+        else:
+            fields = await pipeline.background_fields(artifacts[TZ.kind], has_reference=reference is not None)
+            await db.save_artifact(session_id, BACKGROUND_FIELDS, fields.model_dump_json())
+        image, model = await pipeline.background(fields, await session_ratio(db, session_id), reference)
+    except LLMError as e:
+        log.error("Background failed for session %d: %s", session_id, e)
+        await message.answer(
+            "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз.",
+            reply_markup=retry_keyboard,
         )
-    finally:
-        _running.discard(session_id)
+        return
+    path = save_image(files_dir, session_id, "Фон", image)
+    await db.save_artifact(session_id, BACKGROUND, str(path), model)
+    await message.answer_photo(
+        BufferedInputFile(image.data, filename=path.name),
+        caption=BACKGROUND_CAPTION,
+        reply_markup=background_keyboard,
+    )
 
 
 def background_stage(artifacts: dict[str, str], waiting_for: str | None) -> str | None:
@@ -869,11 +815,7 @@ def background_stage(artifacts: dict[str, str], waiting_for: str | None) -> str 
     return BG_OFFERED
 
 
-def chosen_background(artifacts: dict[str, str]) -> str:
-    """Path to the background the slides are drawn on."""
-    return artifacts[BACKGROUND_ALT] if artifacts.get(BACKGROUND_CHOICE) == "2" else artifacts[BACKGROUND]
-
-
+@_running.handle_cancellation
 async def run_background_change(
     message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int
 ) -> None:
@@ -883,45 +825,38 @@ async def run_background_change(
     «Нарисовать заново» without a reference picks new colors and style too; with a reference
     the style stays the reference's, and only the composition and elements change.
     """
-    if session_id in _running:
-        await message.answer("Работа уже идёт, подождите немного.")
-        return
-    _running.add(session_id)
+    artifacts = await db.get_artifacts(session_id)
+    attempt = artifacts[BACKGROUND_ATTEMPT]
+    ratio = await session_ratio(db, session_id)
+    first = load_image(artifacts[BACKGROUND])
+    if attempt == ATTEMPT_EDIT:
+        await message.answer("Дорабатываю фон. Это может занять до минуты…")
+    else:
+        await message.answer("Рисую новый фон. Это может занять до минуты…")
+    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
     try:
-        artifacts = await db.get_artifacts(session_id)
-        attempt = artifacts[BACKGROUND_ATTEMPT]
-        ratio = await session_ratio(db, session_id)
-        first = load_image(artifacts[BACKGROUND])
         if attempt == ATTEMPT_EDIT:
-            await message.answer("Дорабатываю фон. Это может занять до минуты…")
+            image, model = await pipeline.edit_background(first, artifacts[BACKGROUND_COMMENT], ratio)
         else:
-            await message.answer("Рисую новый фон. Это может занять до минуты…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-        try:
-            if attempt == ATTEMPT_EDIT:
-                image, model = await pipeline.edit_background(first, artifacts[BACKGROUND_COMMENT], ratio)
-            else:
-                reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
-                fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
-                if reference is None:
-                    if BACKGROUND_ALT_FIELDS in artifacts:
-                        fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_ALT_FIELDS])
-                    else:
-                        fields = await pipeline.background_fields(artifacts[TZ.kind], False, previous=fields)
-                        await db.save_artifact(session_id, BACKGROUND_ALT_FIELDS, fields.model_dump_json())
-                image, model = await pipeline.background(fields, ratio, reference, previous=first)
-        except LLMError as e:
-            log.error("Background change (%s) failed for session %d: %s", attempt, session_id, e)
-            await message.answer(
-                "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз или примите первый фон.",
-                reply_markup=background_retry_keyboard,
-            )
-            return
-        path = save_image(files_dir, session_id, "Фон_2", image)
-        await db.save_artifact(session_id, BACKGROUND_ALT, str(path), model)
-        await show_background_choice(message, first, image, attempt)
-    finally:
-        _running.discard(session_id)
+            reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
+            fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
+            if reference is None:
+                if BACKGROUND_ALT_FIELDS in artifacts:
+                    fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_ALT_FIELDS])
+                else:
+                    fields = await pipeline.background_fields(artifacts[TZ.kind], False, previous=fields)
+                    await db.save_artifact(session_id, BACKGROUND_ALT_FIELDS, fields.model_dump_json())
+            image, model = await pipeline.background(fields, ratio, reference, previous=first)
+    except LLMError as e:
+        log.error("Background change (%s) failed for session %d: %s", attempt, session_id, e)
+        await message.answer(
+            "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз или примите первый фон.",
+            reply_markup=background_retry_keyboard,
+        )
+        return
+    path = save_image(files_dir, session_id, "Фон_2", image)
+    await db.save_artifact(session_id, BACKGROUND_ALT, str(path), model)
+    await show_background_choice(message, first, image, attempt)
 
 
 async def show_background_choice(message: Message, first: Image, second: Image, attempt: str) -> None:
@@ -933,255 +868,6 @@ async def show_background_choice(message: Message, first: Image, second: Image, 
         ]
     )
     await message.answer("Какой фон берём для слайдов?", reply_markup=background_choice_keyboard)
-
-
-async def run_slides(
-    message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int
-) -> None:
-    """Everything after the background is accepted, without stops: style (05), slide
-    descriptions (06), slide images (07), then the album and the PDF.
-
-    Each result is saved as soon as it's ready, so a retry continues where it stopped:
-    finished slides are not drawn again.
-    """
-    if session_id in _running:
-        await message.answer("Работа уже идёт, подождите немного.")
-        return
-    _running.add(session_id)
-    try:
-        artifacts = await db.get_artifacts(session_id)
-        ratio = await session_ratio(db, session_id)
-        background = load_image(chosen_background(artifacts))
-        try:
-            if STYLE not in artifacts:
-                await message.answer("Готовлю стиль оформления слайдов…")
-                await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-                style, model = await pipeline.style(background, ratio)
-                await db.save_artifact(session_id, STYLE, style, model)
-                artifacts[STYLE] = style
-            if DESCRIPTIONS not in artifacts:
-                await message.answer("Продумываю, как показать содержимое каждого слайда…")
-                await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-                images = await load_user_images(db, session_id)
-                descriptions, model = await pipeline.descriptions(artifacts[PLAN.kind], images)
-                await db.save_artifact(session_id, DESCRIPTIONS, descriptions, model)
-                artifacts[DESCRIPTIONS] = descriptions
-        except LLMError as e:
-            log.error("Slides preparation failed for session %d: %s", session_id, e)
-            await message.answer(
-                "Нейросеть сейчас не отвечает. Прогресс сохранён — попробуйте ещё раз.",
-                reply_markup=retry_keyboard,
-            )
-            return
-
-        blocks = split_descriptions(artifacts[DESCRIPTIONS])
-        if len(blocks) > MAX_SLIDES:
-            await message.answer(
-                f"В плане {len(blocks)} слайдов, а в демо-версии можно не больше {MAX_SLIDES}. "
-                f"Рисую первые {MAX_SLIDES}."
-            )
-            blocks = dict(list(blocks.items())[:MAX_SLIDES])
-
-        failed = await draw_slides(message, db, pipeline, files_dir, session_id, blocks, ratio, background)
-        if failed:
-            await message.answer(
-                "Не получилось нарисовать слайды: " + ", ".join(map(str, failed)) + ". "
-                "Готовые слайды сохранены — «Повторить» дорисует только недостающие.",
-                reply_markup=retry_keyboard,
-            )
-            return
-
-        report = await check_slides_text(message, db, pipeline, session_id, blocks)
-        artifacts = await db.get_artifacts(session_id)
-        paths = [Path(artifacts[slide_kind(n)]) for n in blocks]
-        await send_slides(message, paths)
-        await db.finish_session(session_id)
-        no_picture = [str(n) for n in blocks if user_image_failed_kind(n) in artifacts]
-        if no_picture:
-            report += (
-                "\n\nНе удалось вставить ваши изображения на слайды: " + ", ".join(no_picture) + ". "
-                "Эти слайды нарисованы без них."
-            )
-        await message.answer(report)
-        await message.answer("Презентация готова!", reply_markup=start_keyboard)
-    finally:
-        _running.discard(session_id)
-
-
-def sample_slide(blocks: dict[int, str], with_picture: set[int] = frozenset()) -> int | None:
-    """Slide whose design the others copy: the second one, as slide 1 is the title slide
-    (prompt 03-1) and its large centered heading doesn't fit content slides. A slide with the
-    user's picture is skipped, or the model would draw similar pictures on the others;
-    None if every slide has one."""
-    numbers = list(blocks)
-    candidates = [n for n in numbers[1:] + numbers[:1] if n not in with_picture]
-    return candidates[0] if candidates else None
-
-
-async def draw_slides(
-    message: Message,
-    db: Database,
-    pipeline: Pipeline,
-    files_dir: Path,
-    session_id: int,
-    blocks: dict[int, str],
-    ratio: str,
-    background: Image,
-) -> list[int]:
-    """Draw the slides that have no saved image yet. Returns the numbers that failed.
-
-    The sample slide (see sample_slide) is drawn alone and then attached to the others as
-    a design sample; the others follow, SLIDE_CONCURRENCY at a time.
-    """
-    artifacts = await db.get_artifacts(session_id)
-    style = artifacts[STYLE]
-    missing = [n for n in blocks if slide_kind(n) not in artifacts]
-    if not missing:
-        return []
-    done = len(blocks) - len(missing)
-    status = await message.answer(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
-    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    failed: list[int] = []
-
-    images = await load_user_images(db, session_id)
-    marker = marker_color(style)
-
-    async def render(number: int, sample: Image | None, picture: UserImage | None, area: bool) -> tuple[Image, str]:
-        prompt = pipeline.slide_prompt(
-            number,
-            blocks[number],
-            style,
-            ratio,
-            with_sample=sample is not None,
-            image=picture,
-            marker=marker if area else None,
-        )
-        # Saved before the request: if the slide comes out wrong, the prompt shows where the problem came from.
-        await db.save_artifact(session_id, slide_prompt_kind(number), prompt)
-        return await pipeline.slide(prompt, ratio, background, sample)
-
-    async def draw_with_picture(number: int, sample: Image | None, picture: UserImage) -> tuple[Path, Image, str]:
-        """The model leaves a marker-colored area, the picture is pasted into it. Two tries;
-        if the area doesn't come out, the slide is drawn without it."""
-        for attempt in (1, 2):
-            image, model = await render(number, sample, picture, area=True)
-            box = await asyncio.to_thread(find_area, image.data, marker)
-            if box is not None:
-                marked = save_image(files_dir, session_id, f"Слайд_{number:02d}_разметка", image)
-                await db.save_artifact(session_id, slide_marked_kind(number), str(marked), model)
-                picture_data = Path(picture.path).read_bytes()
-                data = await asyncio.to_thread(place_image, image.data, box, picture_data, style)
-                final = Image(data, "image/jpeg")
-                return save_image(files_dir, session_id, f"Слайд_{number:02d}", final), final, model
-            log.warning("No area for the user's picture: session %d, slide %d, try %d", session_id, number, attempt)
-        image, model = await render(number, sample, picture, area=False)
-        await db.save_artifact(session_id, user_image_failed_kind(number), "")
-        return save_image(files_dir, session_id, f"Слайд_{number:02d}", image), image, model
-
-    async def draw(number: int, sample: Image | None) -> Image | None:
-        nonlocal done
-        try:
-            if number in images:
-                path, image, model = await draw_with_picture(number, sample, images[number])
-            else:
-                image, model = await render(number, sample, None, area=False)
-                path = save_image(files_dir, session_id, f"Слайд_{number:02d}", image)
-        except LLMError as e:
-            log.error("Slide %d failed for session %d: %s", number, session_id, e)
-            failed.append(number)
-            return None
-        await db.save_artifact(session_id, slide_kind(number), str(path), model)
-        done += 1
-        with suppress(TelegramBadRequest):  # e.g. "message is not modified"
-            await status.edit_text(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
-        return image
-
-    sample_number = sample_slide(blocks, set(images))
-    if sample_number is None:
-        sample = None
-    elif sample_number in missing:
-        sample = await draw(sample_number, None)
-        if sample is None:
-            return failed  # without the sample the others would look different: stop here
-        missing.remove(sample_number)
-    else:
-        sample = load_image(artifacts[slide_kind(sample_number)])
-
-    semaphore = asyncio.Semaphore(SLIDE_CONCURRENCY)
-
-    async def draw_limited(number: int) -> None:
-        async with semaphore:
-            await draw(number, sample)
-
-    await asyncio.gather(*(draw_limited(n) for n in missing))
-    return sorted(failed)
-
-
-async def check_slides_text(
-    message: Message, db: Database, pipeline: Pipeline, session_id: int, blocks: dict[int, str]
-) -> str:
-    """Compare the text drawn on every slide with its description (prompt 08) and return
-    the report for the user. Results are saved, so a retry doesn't check finished slides
-    again; a slide whose check failed is listed as unchecked, it doesn't stop the presentation."""
-    artifacts = await db.get_artifacts(session_id)
-    unchecked = [n for n in blocks if text_check_kind(n) not in artifacts]
-    if unchecked:
-        await message.answer("Проверяю текст на слайдах…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    semaphore = asyncio.Semaphore(TEXT_CHECK_CONCURRENCY)
-
-    async def check(number: int) -> None:
-        async with semaphore:
-            try:
-                # A slide with the user's picture is checked as drawn, before the picture went in:
-                # text on the picture is not the slide's text.
-                slide = load_image(artifacts.get(slide_marked_kind(number)) or artifacts[slide_kind(number)])
-                issues, model = await pipeline.check_slide_text(slide, blocks[number])
-            except LLMError as e:
-                log.warning("Text check of slide %d failed for session %d: %s", number, session_id, e)
-                return
-            except Exception:  # the check is optional: whatever breaks, the slides are still sent
-                log.exception("Text check of slide %d crashed for session %d", number, session_id)
-                return
-        for issue in issues:
-            log.info("Text check: session %d, slide %d: %s", session_id, number, issue.describe())
-        pairs = [[issue.expected, issue.found] for issue in issues]
-        await db.save_artifact(session_id, text_check_kind(number), json.dumps(pairs, ensure_ascii=False), model)
-
-    await asyncio.gather(*(check(n) for n in unchecked))
-    return text_check_report(list(blocks), await db.get_artifacts(session_id))
-
-
-def text_check_report(numbers: list[int], artifacts: dict[str, str]) -> str:
-    lines, unchecked = [], []
-    for number in numbers:
-        saved = artifacts.get(text_check_kind(number))
-        if saved is None:
-            unchecked.append(number)
-            continue
-        for expected, found in json.loads(saved):
-            lines.append(f"• Слайд {number}: {escape(TextIssue(expected, found).describe())}")
-    if lines:
-        text = "Проверка текста на слайдах нашла возможные ошибки:\n" + "\n".join(lines)
-    else:
-        text = "Проверка текста на слайдах: ошибок не найдено."
-    if unchecked:
-        text += "\n\nНе удалось проверить слайды: " + ", ".join(map(str, unchecked)) + "."
-    return text
-
-
-async def send_slides(message: Message, paths: list[Path]) -> None:
-    """Slides as photo albums to look through, then the PDF in full quality."""
-    for i in range(0, len(paths), TELEGRAM_ALBUM_LIMIT):
-        chunk = paths[i : i + TELEGRAM_ALBUM_LIMIT]
-        if len(chunk) == 1:  # an album needs at least 2 items
-            await message.answer_photo(BufferedInputFile(chunk[0].read_bytes(), filename=chunk[0].name))
-            continue
-        await message.answer_media_group(
-            [InputMediaPhoto(media=BufferedInputFile(p.read_bytes(), filename=p.name)) for p in chunk]
-        )
-    pdf = await asyncio.to_thread(build_pdf, paths)
-    await message.answer_document(BufferedInputFile(pdf, filename=PDF_FILENAME))
 
 
 async def session_at_background(callback: CallbackQuery, db: Database, stages: set[str]) -> int | None:
@@ -1214,9 +900,14 @@ async def cmd_start(message: Message) -> None:
 
 @router.callback_query(F.data == NEW_PRESENTATION)
 async def on_new_presentation(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
-    session_id = await db.start_session(callback.from_user.id)
-    await ack(callback)
-    await ask_description(callback.message, db, session_id)
+    async with _user_locks[callback.from_user.id]:
+        previous = await db.get_active_session(callback.from_user.id)
+        if previous is not None:
+            await db.finish_session(previous, status="cancelled")
+            await _running.cancel(previous)
+        session_id = await db.start_session(callback.from_user.id)
+        await ack(callback)
+        await ask_description(callback.message, db, session_id)
 
 
 @router.callback_query(F.data == RETRY_STEP)
@@ -1234,7 +925,7 @@ async def on_retry_step(
         return
     artifacts = await db.get_artifacts(session_id)
     if BACKGROUND_ACCEPTED in artifacts:
-        await run_slides(callback.message, db, pipeline, files_dir, session_id)
+        await continue_generation(callback.message, db, pipeline, files_dir, session_id)
     elif STYLE_REF in artifacts and BACKGROUND not in artifacts:
         await run_design(callback.message, db, pipeline, files_dir, session_id)
     elif background_stage(artifacts, await db.get_waiting_for(session_id)) == BG_PENDING:
@@ -1290,12 +981,16 @@ async def on_survey_show(callback: CallbackQuery, db: Database) -> None:
 async def on_sources_done(callback: CallbackQuery, db: Database, bank: QuestionBank, pipeline: Pipeline) -> None:
     await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
-    if session_id is None or await db.get_waiting_for(session_id) != WAIT_SOURCES:
-        await callback.message.answer("Это сообщение уже неактуально.", reply_markup=start_keyboard)
+    if session_id is None:
+        await callback.message.answer("Активной презентации нет.", reply_markup=start_keyboard)
         return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await db.save_artifact(session_id, SOURCES_DONE, "", model="user")
-    await db.set_waiting_for(session_id, None)
+    async with _source_files_locks[session_id]:
+        if session_id is None or await db.get_waiting_for(session_id) != WAIT_SOURCES:
+            await callback.message.answer("Это сообщение уже неактуально.", reply_markup=start_keyboard)
+            return
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await db.save_artifact(session_id, SOURCES_DONE, "", model="user")
+        await db.set_waiting_for(session_id, None)
     await run_analysis(callback.message, db, bank, pipeline, session_id)
 
 
@@ -1462,7 +1157,7 @@ async def on_style_preset(
     callback: CallbackQuery, db: Database, pipeline: Pipeline, files_dir: Path, presets: PresetStore
 ) -> None:
     """«Стиль N»: the prepared design replaces the reference, the background (04) and the style (05);
-    the background counts as accepted, so the slides start at once."""
+    the background counts as accepted, then the generation mode is chosen."""
     await ack(callback)
     session_id = await db.get_active_session(callback.from_user.id)
     if session_id is None or await db.get_waiting_for(session_id) != WAIT_STYLE_REF:
@@ -1482,7 +1177,7 @@ async def on_style_preset(
     await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
     await db.set_waiting_for(session_id, None)
     await callback.message.answer(f"Выбран стиль {preset.number}.")
-    await run_slides(callback.message, db, pipeline, files_dir, session_id)
+    await continue_generation(callback.message, db, pipeline, files_dir, session_id)
 
 
 @router.callback_query(F.data == BACKGROUND_ACCEPT)
@@ -1500,7 +1195,7 @@ async def on_background_accept(
     await callback.message.edit_reply_markup(reply_markup=None)
     await db.set_waiting_for(session_id, None)
     await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
-    await run_slides(callback.message, db, pipeline, files_dir, session_id)
+    await continue_generation(callback.message, db, pipeline, files_dir, session_id)
 
 
 @router.callback_query(F.data == BACKGROUND_EDIT)
@@ -1541,7 +1236,7 @@ async def on_background_pick(
     await db.save_artifact(session_id, BACKGROUND_CHOICE, choice, model="user")
     await db.save_artifact(session_id, BACKGROUND_ACCEPTED, "", model="user")
     await callback.message.answer(f"Беру вариант {choice}.")
-    await run_slides(callback.message, db, pipeline, files_dir, session_id)
+    await continue_generation(callback.message, db, pipeline, files_dir, session_id)
 
 
 def unexpected_file_text(waiting_for: str | None) -> str:
@@ -1613,12 +1308,14 @@ async def on_document(
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, db: Database) -> None:
-    session_id = await db.get_active_session(message.from_user.id)
-    if session_id is None:
-        await message.answer("Активной презентации нет.", reply_markup=start_keyboard)
-        return
-    await db.finish_session(session_id, status="cancelled")
-    await message.answer("Презентация отменена.", reply_markup=start_keyboard)
+    async with _user_locks[message.from_user.id]:
+        session_id = await db.get_active_session(message.from_user.id)
+        if session_id is None:
+            await message.answer("Активной презентации нет.", reply_markup=start_keyboard)
+            return
+        await db.finish_session(session_id, status="cancelled")
+        await _running.cancel(session_id)
+        await message.answer("Презентация отменена.", reply_markup=start_keyboard)
 
 
 @router.message(F.text)
@@ -1687,7 +1384,7 @@ async def on_answer(
     artifacts = await db.get_artifacts(session_id)
     if BACKGROUND_ACCEPTED in artifacts:
         # Slides are being drawn, or the previous attempt failed: continue.
-        await run_slides(message, db, pipeline, files_dir, session_id)
+        await continue_generation(message, db, pipeline, files_dir, session_id)
         return
     stage = background_stage(artifacts, waiting_for)
     if stage == BG_CHOICE:

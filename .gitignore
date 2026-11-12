@@ -26,3 +26,21 @@ snapshots/
 # Server address and SSH key path (public repository)
 scripts/server.sh
 .DS_Store
+
+# Additional local credentials, databases and logs
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pid
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Owner-specific local assistant permissions
+/AGENTS.md

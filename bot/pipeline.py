@@ -9,6 +9,7 @@ from google.genai import types
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from bot.llm import Image, ImageLLM, LLMError, TextLLM
+from bot.plan import plan_slides
 from bot.questions import Survey
 from bot.search import SearchResult, WebSearch
 from bot.sources import SourceFile
@@ -47,6 +48,7 @@ SKIPPED_ANSWER = "Не указано"  # saved when the user presses «Проп
 SOURCES = "sources"
 
 SEARCH_QUERIES_PROMPT = "02a_search_queries"
+PLAN_CHECK_PROMPT = "03-2_plan_check"  # run right after 03-1, inside the PLAN step
 # Gemini accepts up to 20 MB inside one request; bigger sets of files go through the File API.
 INLINE_FILES_LIMIT = 15_000_000
 
@@ -282,6 +284,20 @@ def split_descriptions(text: str) -> dict[int, str]:
     return blocks
 
 
+def validate_descriptions(plan: str, text: str) -> dict[int, str]:
+    """Require one description per approved slide, in the approved order."""
+    expected = list(plan_slides(plan))
+    headers = [int(match.group(1)) for match in _DESCRIPTION_HEADER.finditer(text)]
+    if not expected or headers != expected:
+        raise LLMError(
+            f"description slide numbers {headers} do not match plan {expected}", quota_exceeded=False
+        )
+    blocks = split_descriptions(text)
+    if any(not expected_text(block).strip() for block in blocks.values()):
+        raise LLMError("description lacks expected slide text", quota_exceeded=False)
+    return blocks
+
+
 def build_slide_prompt(template: str, number: int, description: str, style: str, ratio: str) -> str:
     values = {"number": str(number), "description": description, "style": style, "ratio": ratio}
     for name, value in values.items():
@@ -310,6 +326,8 @@ class Pipeline:
         self.search = search
         self.prompts_dir = prompts_dir
         self.max_queries = max_queries
+        self.editable_enabled = False
+        self.editable_service = None
 
     async def run_step(
         self,
@@ -329,8 +347,29 @@ class Pipeline:
             if invented:
                 log.warning("DATA result cites URLs that were not in search results: %s", sorted(invented))
         if step is PLAN:
-            result = strip_review_request(result)
+            result = await self.check_plan(artifacts, strip_review_request(result))
         return result, model
+
+    async def check_plan(self, artifacts: dict[str, str], plan: str) -> str:
+        """Prompt 03-2: the plan checked against the ТЗ and the data structure and corrected.
+        On any failure the plan of 03-1 is kept: the check only improves it."""
+        try:
+            template = load_prompt(self.prompts_dir, PLAN_CHECK_PROMPT)
+            checked, model = await self.llm.generate(
+                f"{template}\n\n"
+                f"ТЕХНИЧЕСКОЕ ЗАДАНИЕ НА ПРЕЗЕНТАЦИЮ\n\n{artifacts[TZ.kind]}\n\n"
+                f"СТРУКТУРА ДАННЫХ\n\n{artifacts[DATA.kind]}\n\n"
+                f"ПОСЛАЙДОВЫЙ ПЛАН ПРЕЗЕНТАЦИИ\n\n{plan}"
+            )
+        except (LLMError, OSError) as e:  # OSError: no prompt file, e.g. after rolling the prompts back
+            log.warning("Plan check failed, keeping the plan as is: %s", e)
+            return plan
+        checked = strip_review_request(checked)
+        if not plan_slides(checked):  # the answer lost the «СЛАЙД N» structure
+            log.warning("Plan check returned no slides, keeping the plan as is")
+            return plan
+        log.info("Plan checked by %s", model)
+        return checked
 
     async def analyze_survey(
         self, survey: Survey, description: str, note: str | None, sources: list[SourceFile]
@@ -479,8 +518,7 @@ class Pipeline:
                 f"ПОСЛАЙДОВЫЙ ПЛАН ПРЕЗЕНТАЦИИ\n\n{plan}\n\nИЗОБРАЖЕНИЯ ПОЛЬЗОВАТЕЛЯ\n\n" + "\n".join(lines)
             )
         text, model = await self.llm.generate(request)
-        if not split_descriptions(text):
-            raise LLMError(f"no «Изображение N» blocks in descriptions: {text[:200]}", quota_exceeded=False)
+        validate_descriptions(plan, text)
         return text, model
 
     async def check_slide_text(self, slide: Image, description: str) -> tuple[list[TextIssue], str | None]:

@@ -102,10 +102,15 @@ class Database:
 
     async def finish_session(self, session_id: int, status: str = "completed") -> None:
         await self.conn.execute(
-            "UPDATE sessions SET status = ?, finished_at = datetime('now') WHERE id = ?",
+            "UPDATE sessions SET status = ?, finished_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
             (status, session_id),
         )
         await self.conn.commit()
+
+    async def is_active(self, session_id: int) -> bool:
+        async with self.conn.execute("SELECT status FROM sessions WHERE id = ?", (session_id,)) as cur:
+            row = await cur.fetchone()
+        return row is not None and row["status"] == "in_progress"
 
     async def get_waiting_for(self, session_id: int) -> str | None:
         async with self.conn.execute("SELECT waiting_for FROM sessions WHERE id = ?", (session_id,)) as cur:
