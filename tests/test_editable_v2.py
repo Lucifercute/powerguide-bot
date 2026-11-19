@@ -59,7 +59,8 @@ class EmbeddedFontTests(unittest.TestCase):
                 rid = entry.find(f'{{{P}}}{slot}').get(f'{{{R}}}id')
                 eot = files['ppt/' + targets[rid]]
                 total, data_size, version, flags = struct.unpack_from('<4I', eot)
-                self.assertEqual((total, version, flags), (len(eot), 0x10000, 0))
+                # Windows/PowerPoint reject EOT 0x00010000; 0x00020002 is what Windows itself writes.
+                self.assertEqual((total, version, flags), (len(eot), 0x20002, 0))
                 self.assertEqual(struct.unpack_from('<H', eot, 34)[0], 0x504C)
                 font = TTFont(io.BytesIO(eot[-data_size:]))
                 self.assertNotIn('fvar', font)

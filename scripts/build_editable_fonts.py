@@ -1,4 +1,4 @@
-"""Build regular/bold Google Font faces, WOFF2 and uncompressed EOT v1.
+"""Build regular/bold Google Font faces, WOFF2 and uncompressed EOT 2.2.
 
 Sources and OFL licenses live in assets/fonts. No network requests are made.
 EOT header: https://www.w3.org/submissions/EOT/#EOTHeader
@@ -21,14 +21,19 @@ def eot(data):
         raise ValueError('Font does not permit editable outline embedding')
     panose = bytes(getattr(os2.panose, n) for n in ('bFamilyType', 'bSerifStyle', 'bWeight',
         'bProportion', 'bContrast', 'bStrokeVariation', 'bArmStyle', 'bLetterForm', 'bMidline', 'bXHeight'))
-    header = struct.pack('<4I10sBBIHH7I4I', 0, len(data), 0x10000, 0, panose, 1,
+    # Version 0x00020002, as Windows' own TTEmbedFont writes it. Windows (t2embed), which PowerPoint
+    # uses to install embedded fonts, rejects version 0x00010000 ("general error" on opening).
+    header = struct.pack('<4I10sBBIHH7I4I', 0, len(data), 0x20002, 0, panose, 1,
         bool(os2.fsSelection & 1), os2.usWeightClass, os2.fsType, 0x504C,
         *[getattr(os2, f'ulUnicodeRange{i}') for i in range(1, 5)],
         getattr(os2, 'ulCodePageRange1', 0), getattr(os2, 'ulCodePageRange2', 0),
         font['head'].checkSumAdjustment, 0, 0, 0, 0)
     for number in (1, 2, 5, 4):
-        value = (font['name'].getDebugName(number) or '').encode('utf-16-le')
+        value = ((font['name'].getDebugName(number) or '') + '\0').encode('utf-16-le')
         header += struct.pack('<HH', 0, len(value)) + value
+    # Empty RootString; RootStringCheckSum 0x50475342 (no root strings); EUDCCodePage;
+    # empty signature; no EUDC font.
+    header += struct.pack('<HH', 0, 0) + struct.pack('<II', 0x50475342, 1252) + struct.pack('<HHII', 0, 0, 0, 0)
     return struct.pack('<I', len(header) + len(data)) + header[4:] + data
 
 
