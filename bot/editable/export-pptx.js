@@ -348,7 +348,13 @@ function textObjects(node,root){
 }
 function elementBackground(el,root,pseudo){
  const c=getComputedStyle(el,pseudo||null),box=rect(el,root);
- if(pseudo){if(c.content==='none'||c.content==='normal')return [];box.w=parseFloat(c.width)||box.w;box.h=parseFloat(c.height)||box.h;box.x+=parseFloat(c.left)||0;box.y+=parseFloat(c.top)||0;}
+ if(pseudo){
+  if(c.content==='none'||c.content==='normal')return [];
+  box.w=parseFloat(c.width)||box.w;box.h=parseFloat(c.height)||box.h;
+  // An absolute pseudo-element is placed from the padding box: inside the element's border.
+  const inside=/absolute|fixed/.test(c.position)?[el.clientLeft,el.clientTop]:[0,0];
+  box.x+=(parseFloat(c.left)||0)+inside[0];box.y+=(parseFloat(c.top)||0)+inside[1];
+ }
  const fill=gradient(c.backgroundImage)||color(c.backgroundColor),sides=['Top','Right','Bottom','Left'];
  const uniform=sides.every(s=>c[`border${s}Width`]===c.borderTopWidth&&c[`border${s}Color`]===c.borderTopColor);
  const border=uniform?(parseFloat(c.borderTopWidth)||0):0,objects=[];
@@ -462,14 +468,29 @@ function drawLinks(g){
  svg.setAttribute('viewBox',`0 0 ${g.clientWidth} ${g.clientHeight}`);
  svg.style.cssText=`position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:-1;color:${cg.getPropertyValue('--link-color').trim()||'currentColor'}`;
  g.prepend(svg);
- const local=el=>{const r=el.getBoundingClientRect();return{l:r.left-ox,t:r.top-oy,r:r.right-ox,b:r.bottom-oy,x:(r.left+r.right)/2-ox,y:(r.top+r.bottom)/2-oy};};
- // Point on the border of rect a (plus gap) on the way from its centre towards p.
- const exit=(a,p)=>{const dx=p[0]-a.x,dy=p[1]-a.y,hw=(a.r-a.l)/2+gap,hh=(a.b-a.t)/2+gap;const k=1/Math.max(Math.abs(dx)/hw||0,Math.abs(dy)/hh||0,1e-9);return[a.x+dx*k,a.y+dy*k];};
+ // A line joins the visible mark of a node (its icon container: circle, hexagon, tile),
+ // not the whole group with its caption; data-anchor inside a node overrides the choice.
+ const anchorOf=node=>{
+  const own=node.querySelector('[data-anchor]');if(own)return own;
+  const icon=node.querySelector('svg[data-icon]');
+  for(let e=icon?.parentElement;e&&e!==node.parentElement;e=e.parentElement){
+   const s=getComputedStyle(e);
+   if(e===node||s.backgroundColor!=='rgba(0, 0, 0, 0)'||parseFloat(s.borderTopWidth)>0||s.clipPath!=='none')return e;
+  }
+  return node;
+ };
+ const local=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+  const round=parseFloat(s.borderTopLeftRadius)>=Math.min(r.width,r.height)/2-1||s.clipPath.startsWith('circle')||s.clipPath.startsWith('ellipse');
+  return{l:r.left-ox,t:r.top-oy,r:r.right-ox,b:r.bottom-oy,x:(r.left+r.right)/2-ox,y:(r.top+r.bottom)/2-oy,round};};
+ // Point on the outline of a (plus gap) on the way from its centre towards p: ellipse for round marks.
+ const exit=(a,p)=>{const dx=p[0]-a.x,dy=p[1]-a.y,hw=(a.r-a.l)/2+gap,hh=(a.b-a.t)/2+gap;
+  const k=a.round?1/Math.max(Math.hypot(dx/hw,dy/hh),1e-9):1/Math.max(Math.abs(dx)/hw||0,Math.abs(dy)/hh||0,1e-9);
+  return[a.x+dx*k,a.y+dy*k];};
  const missing=[];
  for(const [from,to,label] of links){
   const na=g.querySelector(`[data-node="${CSS.escape(from)}"]`),nb=g.querySelector(`[data-node="${CSS.escape(to)}"]`);
   if(!na||!nb){missing.push(!na?from:to);continue;}
-  const a=local(na),b=local(nb),dx=b.x-a.x,dy=b.y-a.y,horizontal=Math.abs(dx)>=Math.abs(dy);
+  const a=local(anchorOf(na)),b=local(anchorOf(nb)),dx=b.x-a.x,dy=b.y-a.y,horizontal=Math.abs(dx)>=Math.abs(dy);
   let s,e,dir;
   if(shape==='straight'){s=exit(a,[b.x,b.y]);e=exit(b,[a.x,a.y]);const len=Math.hypot(e[0]-s[0],e[1]-s[1])||1;dir=[(e[0]-s[0])/len,(e[1]-s[1])/len];}
   else if(horizontal){s=[dx>0?a.r+gap:a.l-gap,a.y];e=[dx>0?b.l-gap:b.r+gap,b.y];dir=[Math.sign(dx),0];}
@@ -494,6 +515,25 @@ function drawLinks(g){
  return missing;
 }
 function drawAllLinks(root=document){return Array.from(root.querySelectorAll('[data-links]')).flatMap(drawLinks);}
+// A radial diagram (one node linked to all others) reads as balanced only when the hub's mark
+// sits at the centre of the surrounding marks. Returns offsets above 6 % of the diagram size.
+function hubOffsets(slide){
+ const found=[];
+ for(const g of slide.querySelectorAll('[data-links]')){
+  let links;try{links=JSON.parse(g.dataset.links||'[]');}catch{continue;}
+  const count={};for(const [a,b] of links){count[a]=(count[a]||0)+1;count[b]=(count[b]||0)+1;}
+  const ids=Object.keys(count),hub=ids.find(i=>count[i]===links.length&&links.length>=3);
+  if(!hub)continue;
+  const mark=id=>{const n=g.querySelector(`[data-node="${CSS.escape(id)}"]`);if(!n)return null;
+   const icon=n.querySelector('[data-anchor]')||n.querySelector('svg[data-icon]')?.parentElement||n;const r=icon.getBoundingClientRect();return[(r.left+r.right)/2,(r.top+r.bottom)/2];};
+  const centre=mark(hub),others=ids.filter(i=>i!==hub).map(mark).filter(Boolean);
+  if(!centre||others.length<3)continue;
+  const cx=others.reduce((s,p)=>s+p[0],0)/others.length,cy=others.reduce((s,p)=>s+p[1],0)/others.length,box=g.getBoundingClientRect();
+  const dx=(centre[0]-cx)/box.width,dy=(centre[1]-cy)/box.height;
+  if(Math.hypot(dx,dy)>.06)found.push({node:hub,dx:Math.round(centre[0]-cx),dy:Math.round(centre[1]-cy)});
+ }
+ return found;
+}
 // Collisions the model cannot see without a render: text over text, text panels overlapping
 // each other, connectors that leave one node and end in empty space.
 function overlapArea(a,b){return Math.max(0,Math.min(a.right,b.right)-Math.max(a.left,b.left))*Math.max(0,Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top));}
@@ -582,7 +622,7 @@ async function collectSlides(options={}){
   for(const slide of slides)slide.style.cssText+=`;display:${slideDisplay}!important;width:${W}px!important;height:${H}px!important;transform:none!important;flex-shrink:0!important;`;
   const results=[];
   for(const slide of slides){
-   const fit=fitWords(slide,minFont),missingNodes=drawAllLinks(slide),collisions=measureCollisions(slide);
+   const fit=fitWords(slide,minFont),missingNodes=drawAllLinks(slide),collisions=measureCollisions(slide),hub=hubOffsets(slide);
    const root=slide.getBoundingClientRect(),objects=[];
    const bg=getComputedStyle(slide).backgroundImage;
    const raster=bg.match(/^url\(["']?(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)["']?\)$/);
@@ -608,7 +648,7 @@ async function collectSlides(options={}){
     for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects,fit,collisions,missingNodes,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
+   results.push({background:visibleBackground(slide),objects,fit,collisions,missingNodes,hub,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}

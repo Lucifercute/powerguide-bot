@@ -63,6 +63,11 @@ def slide_issues(result) -> dict:
         if row.get('items'):
             add(row['slide'], 'Код не нашёл узлы для связей: ' + ', '.join(dict.fromkeys(row['items']))
                 + '. Каждому узлу связей нужен элемент data-node="ID узла" внутри data-infographic.')
+    for row in result.get('hubOffsets', []):
+        for hub in row.get('items', []):
+            add(row['slide'], f'Центр радиальной схемы смещён: значок узла {hub["node"]} на ({hub["dx"]}, {hub["dy"]}) px '
+                'от центра окружающих узлов. Поставь значок центрального узла в их геометрический центр; '
+                'его подпись — под значком, не сдвигая сам значок.')
     for row in result.get('collisions', []):
         if row.get('text'):
             add(row['slide'], 'Тексты наезжают друг на друга: ' + json.dumps(row['text'][:4], ensure_ascii=False)
