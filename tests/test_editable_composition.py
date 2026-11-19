@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import unittest.mock
 
 from bot.editable.composition import composition_issues
 from bot.editable.browser import render, chrome_path
@@ -18,6 +19,14 @@ class CompositionTests(unittest.TestCase):
                 row(3,panels=1,area=.23,form='text_image'),row(4,kind='process'),
                 row(5,panels=4,area=.44,form='kpi'),row(6,kind='closing')]
         self.assertEqual(composition_issues(rows)[0]['slides'], [2,3,5])
+
+    def test_panel_check_can_be_turned_off(self):
+        rows = [row(1,kind='cover'),row(2,panels=3,area=.3),row(3,panels=1,area=.23),row(4,kind='process'),
+                row(5,panels=4,area=.44),row(6,kind='closing')]
+        with unittest.mock.patch.dict('os.environ', {'EDITABLE_PANEL_CHECK': '0'}):
+            self.assertEqual(composition_issues(rows), [])
+        with unittest.mock.patch.dict('os.environ', {'EDITABLE_PANEL_CHECK': '1'}):
+            self.assertEqual(len(composition_issues(rows)), 1)
 
     def test_open_kpi_image_and_connected_process_pass(self):
         rows = [row(1,panels=3,area=.3,form='cards'),row(2,form='text_image'),

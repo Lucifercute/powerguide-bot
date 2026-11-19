@@ -1,7 +1,15 @@
 """Deck-level checks based on painted content, not model-supplied form names."""
+import os
+
+
+def panel_check_enabled():
+    """EDITABLE_PANEL_CHECK=0 turns off the 'too many text panels' check (it triggers most layout repairs)."""
+    return os.getenv('EDITABLE_PANEL_CHECK', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 
 
 def composition_issues(rows):
+    if not panel_check_enabled():
+        return []
     content = [r for r in rows if r and r.get('visualType') not in (None, 'cover', 'closing')]
     # Small decks and a small number of necessary cards are legitimate.
     if len(content) < 4:
