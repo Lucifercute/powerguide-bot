@@ -172,6 +172,44 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
                          ['Презентация_редактируемая.pptx', 'Презентация.html', 'Презентация.html'])
         self.assertFalse(await self.db.is_active(self.sid))
 
+    async def test_review_finding_sends_the_render_with_the_repair(self):
+        bg = self.root/'bg.png'; PILImage.new('RGB', (160, 90), 'white').save(bg)
+        await self.db.save_artifact(self.sid, BACKGROUND, str(bg))
+        await self.db.save_artifact(self.sid, STYLE, 'light')
+        await self.db.save_artifact(self.sid, PLAN.kind, 'СЛАЙД 1\nЗАГОЛОВОК: Портфолио\nСОДЕРЖАНИЕ: Проверка 12,5%\nСЛАЙД 2\nЗАГОЛОВОК: Процесс\nСОДЕРЖАНИЕ: Вход → Выход')
+        await self.db.save_artifact(self.sid, user_image_kind(2), UserImage(str(bg),160,90).to_json())
+        plan, _ = fixtures()
+        plan.slides[0].illustration = 'Портфолио'
+        slide1 = SlideMarkup(css='h1{font-size:48px}', html='<section class="slide" data-slide="1" data-visual-type="cover">'
+                             '<h1>Проверка</h1><img data-asset-id="slide-1-image" style="width:160px;height:160px"></section>',
+                             image_prompt='Conceptual illustration', image_alt='Иллюстрация')
+        slide2 = SlideMarkup(css='.node{border:2px solid blue}', html='<section class="slide" data-slide="2" data-visual-type="process">'
+                             '<h1>Процесс</h1><div data-infographic="process"><div data-node="a" class="node">Вход</div>'
+                             '<div data-node="b" class="node">Выход</div></div>'
+                             '<img data-user-slide="2" style="width:300px;height:200px;object-fit:contain"></section>')
+        answers = [(plan.model_dump_json(), 'fake'), (slide1.model_dump_json(), 'fake'), (slide2.model_dump_json(), 'fake'),
+                   (slide2.model_dump_json(), 'fake')]
+        llm = SimpleNamespace(generate=AsyncMock(side_effect=answers))
+        reviews = {1: '{"problems": []}', 2: '{"problems": ["Подпись наезжает на узел справа"]}'}
+        async def review(parts, *_, **__):
+            return reviews[int(parts[0].rsplit('"title": "', 1)[1].startswith('Процесс')) + 1], 'flash'
+        reviewer = SimpleNamespace(generate=AsyncMock(side_effect=review))
+        images = SimpleNamespace(generate=AsyncMock(return_value=(SimpleNamespace(data=bg.read_bytes(),mime_type='image/png'),'fake')))
+        service = EditableService(llm, images, prompt_set=PromptSet('test plan', 'test html', 'test image', 'test review'),
+                                  parallel=1, reviewer=reviewer)
+        async def render_ok(source, output, *_, **__):
+            output.write_bytes(b'pptx')
+            for n in (1, 2):
+                (source.parent/f'preview-slide-{n}.png').write_bytes(f'render {n} {llm.generate.await_count}'.encode())
+            return {'issues': {}, 'textBounds': []}
+        with patch('bot.editable.service.chrome_path', return_value='/fake'), patch('bot.editable.service.render', AsyncMock(side_effect=render_ok)):
+            await service.generate(self.db,self.sid,self.root,AsyncMock())
+        self.assertEqual(llm.generate.await_count, 4)          # plan, two slides, one repair
+        repair = llm.generate.await_args_list[3].args[0]
+        self.assertIn('Подпись наезжает на узел справа', repair[0])
+        self.assertIn('Image 2: current render of this slide.', repair)
+        self.assertEqual(reviewer.generate.await_count, 3)     # both slides, then the repaired one
+
     async def test_cached_generation_retries_export_without_model_calls(self):
         bg = self.root/'bg.png'; PILImage.new('RGB', (160, 90), 'white').save(bg)
         await self.db.save_artifact(self.sid, BACKGROUND, str(bg))

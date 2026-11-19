@@ -28,6 +28,8 @@ class Config:
     editable_text_models: tuple[str, ...] = ()
     editable_thinking: str = "low"
     editable_parallel: int = 4
+    # Vision model that reviews rendered slides (empty = no review).
+    editable_review_models: tuple[str, ...] = ()
 
 
 def _required(name: str) -> str:
@@ -71,6 +73,7 @@ def load_config() -> Config:
         editable_text_models=tuple(_split(os.getenv("EDITABLE_TEXT_MODELS", ""))),
         editable_thinking=_thinking(os.getenv("EDITABLE_THINKING", "low")),
         editable_parallel=max(1, int(os.getenv("EDITABLE_PARALLEL", "4"))),
+        editable_review_models=tuple(_split(os.getenv("EDITABLE_REVIEW_MODELS", ""))),
     )
 
 

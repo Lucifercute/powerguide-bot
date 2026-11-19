@@ -62,7 +62,9 @@ async def main(args):
             try:await render(baseline/'presentation.html',baseline/'presentation.pptx',meta['slides'],meta['width'],meta['height'])
             except ValueError as e:write(baseline/'validation.txt',str(e));print('Baseline:',str(e)[:250],flush=True)
         service=EditableService(llm,images,config.prompts_dir,presets_dir=config.presets_dir,
-                                thinking=config.editable_thinking,parallel=config.editable_parallel)
+                                thinking=config.editable_thinking,parallel=config.editable_parallel,
+                                reviewer=TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_review_models))
+                                if config.editable_review_models else None)
         source,output=await service.generate(db,args.session,out/'data/sessions',status)
         await db.finish_session(args.session)
         write(state,{'status':'completed','source_session':args.session,'html':str(source),'pptx':str(output),

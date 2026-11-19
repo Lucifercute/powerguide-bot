@@ -18,7 +18,9 @@ def create_pipeline(config):
     if config.editable_text_models:
         # Layout quality depends on the model most: allow a stronger one only for these stages.
         editable_llm = TextLLM(config.gemini_api_key, [], config.vertex_api_key, list(config.editable_text_models))
+    reviewer = (TextLLM(config.gemini_api_key, [], config.vertex_api_key, list(config.editable_review_models))
+                if config.editable_review_models else None)
     pipeline.editable_service = EditableService(editable_llm, pipeline.images, config.prompts_dir,
                                                 presets_dir=config.presets_dir, thinking=config.editable_thinking,
-                                                parallel=config.editable_parallel)
+                                                parallel=config.editable_parallel, reviewer=reviewer)
     return pipeline

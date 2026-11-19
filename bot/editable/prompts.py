@@ -7,6 +7,8 @@ FILES = {
     "HTML": "editable_html.md",
     "IMAGE": "editable_image.md",
 }
+# Optional: without it the rendered slides are not reviewed by a model.
+OPTIONAL = {"REVIEW": "editable_review.md"}
 
 
 @dataclass(frozen=True)
@@ -14,6 +16,7 @@ class PromptSet:
     PLAN: str
     HTML: str
     IMAGE: str
+    REVIEW: str = ""
 
 
 def load(directory: Path) -> PromptSet:
@@ -27,4 +30,6 @@ def load(directory: Path) -> PromptSet:
     values = {key: (directory / name).read_text(encoding="utf-8") for key, name in FILES.items()}
     if any(not value.strip() for value in values.values()):
         raise RuntimeError("Файлы промптов редактируемой презентации не должны быть пустыми")
+    values.update({key: (directory / name).read_text(encoding="utf-8")
+                   for key, name in OPTIONAL.items() if (directory / name).is_file()})
     return PromptSet(**values)

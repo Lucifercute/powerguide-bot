@@ -22,7 +22,7 @@ from bot.runtime import chosen_background, load_user_images, session_ratio
 from . import prompts
 from .browser import chrome_path, render
 from .html import assemble, normalize_markup, package, slide_contract, validate_markup, validate_plan
-from .models import SlideMarkup, VisualPlan
+from .models import SlideMarkup, SlideReview, VisualPlan
 
 EXPORT_VERSION = 11
 THINKING = {'low': types.ThinkingLevel.LOW, 'medium': types.ThinkingLevel.MEDIUM, 'high': types.ThinkingLevel.HIGH}
@@ -64,8 +64,10 @@ def image_data(path):
 
 class EditableService:
     def __init__(self, llm, images, prompts_dir=Path('prompts'), *, prompt_set=None, presets_dir=Path('presets'),
-                 thinking='low', parallel=4):
+                 thinking='low', parallel=4, reviewer=None):
         self.llm, self.images = llm, images
+        # Optional cheap vision model that looks at each rendered slide for visible defects.
+        self.reviewer = reviewer
         self.prompts_dir = Path(prompts_dir)
         self.prompt_set = prompt_set
         self.presets = PresetStore(Path(presets_dir))
@@ -77,8 +79,9 @@ class EditableService:
             response_mime_type='application/json', response_schema=schema, max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=types.ThinkingConfig(thinking_level=THINKING[self.thinking]))
 
-    async def _json_stage(self, folder, name, prompt, schema, validate, background, *, normalize=None):
-        """Request, validate and cache one structured answer; up to two corrective retries."""
+    async def _json_stage(self, folder, name, prompt, schema, validate, background, *, normalize=None, extra=()):
+        """Request, validate and cache one structured answer; up to two corrective retries.
+        extra: (caption, bytes, mime) images sent after the background."""
         final = folder / f'{name}.json'
         if final.exists():
             value = schema.model_validate_json(final.read_text(encoding='utf-8'))
@@ -97,11 +100,13 @@ class EditableService:
             if not raw.exists():
                 write(prefix.with_suffix('.request.json'), {
                     'prompt': actual, 'background_sha256': sha(background[0]), 'schema': schema.model_json_schema(),
+                    'images': [{'caption': c, 'sha256': sha(d)} for c, d, _ in extra],
                     'config': {'thinking_level': self.thinking, 'max_output_tokens': MAX_OUTPUT_TOKENS}})
                 usage = {}
-                text, model = await self.llm.generate(
-                    [actual, 'Image 1: exact background.', types.Part.from_bytes(data=background[0], mime_type=background[1])],
-                    self._config(schema), usage=usage)
+                parts = [actual, 'Image 1: exact background.', types.Part.from_bytes(data=background[0], mime_type=background[1])]
+                for caption, data, mime in extra:
+                    parts += [caption, types.Part.from_bytes(data=data, mime_type=mime)]
+                text, model = await self.llm.generate(parts, self._config(schema), usage=usage)
                 write(raw, {'model': model, 'text': text, 'usage': usage})
             saved = read_json(raw)
             try:
@@ -118,7 +123,7 @@ class EditableService:
             return value
         raise ValueError(f'Не удалось проверить этап {name}; сохранены запросы и ответы')
 
-    async def _slides(self, folder, plan, numbers, prompt_for, pictures, background, suffix=''):
+    async def _slides(self, folder, plan, numbers, prompt_for, pictures, background, suffix='', extra_for=None):
         """Lay out the given slides in parallel; returns {number: SlideMarkup}."""
         gate = asyncio.Semaphore(self.parallel)
         specs = {s.number: s for s in plan.slides}
@@ -129,8 +134,42 @@ class EditableService:
                 return n, await self._json_stage(
                     folder, f'slide-{n}{suffix}', prompt_for(spec), SlideMarkup,
                     lambda m: validate_markup(m, spec, n in pictures), background,
-                    normalize=lambda m: normalize_markup(m, spec))
+                    normalize=lambda m: normalize_markup(m, spec), extra=extra_for(n) if extra_for else ())
         return dict(await asyncio.gather(*(one(n) for n in numbers)))
+
+    async def _review(self, folder, plan, numbers, instructions, round_):
+        """A vision model looks at each rendered slide; returns {number: [problems]}. Cached per render."""
+        if not self.reviewer or not instructions.REVIEW.strip():
+            return {}
+        specs = {s.number: s for s in plan.slides}
+        gate = asyncio.Semaphore(4)
+        config = types.GenerateContentConfig(
+            response_mime_type='application/json', response_schema=SlideReview, max_output_tokens=4096,
+            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW))
+
+        async def one(n):
+            path = folder / f'review-{n}-r{round_ + 1}.json'
+            picture = (folder / f'preview-slide-{n}.png').read_bytes()
+            if path.exists() and read_json(path).get('render_sha256') == sha(picture):
+                return n, read_json(path)['problems']
+            spec = specs[n]
+            slide = {'title': spec.title, 'visual_type': spec.visual_type, 'form': spec.form,
+                     'nodes': [node.label for node in spec.nodes],
+                     'links': [f'{e.source} → {e.target}' for e in spec.edges]}
+            async with gate:
+                usage = {}
+                try:
+                    text, model = await self.reviewer.generate(
+                        [instructions.REVIEW + '\nSLIDE\n' + json.dumps(slide, ensure_ascii=False),
+                         'Image 1: the rendered slide.', types.Part.from_bytes(data=picture, mime_type='image/png')],
+                        config, usage=usage)
+                    problems = SlideReview.model_validate_json(text).problems
+                except Exception as error:  # the review only adds hints; a failure must not stop the export
+                    write(path.with_suffix('.error.txt'), f'{type(error).__name__}: {error}')
+                    return n, []
+            write(path, {'render_sha256': sha(picture), 'model': model, 'usage': usage, 'problems': problems})
+            return n, problems
+        return {n: p for n, p in await asyncio.gather(*(one(n) for n in numbers)) if p}
 
     async def _illustrations(self, folder, deck, instructions, context, background, status):
         assets = {}
@@ -242,18 +281,30 @@ class EditableService:
                                                      width, height, session_id, context.get('font_policy')))
             await status('Собираю PowerPoint и проверяю вёрстку…')
             result = await render(final_html, final_pptx, len(numbers), width, height, previews=True)
-            issues = {int(k): v for k, v in result['issues'].items()}
+            issues = {int(k): list(v) for k, v in result['issues'].items()}
+            # First round: every slide; second: only the redone ones (the rest did not change).
+            review = await self._review(folder, plan, sorted(repaired) if round_ else numbers, instructions, round_)
+            for n, problems in review.items():
+                issues.setdefault(n, []).extend('Визуальная проверка: ' + p for p in problems)
+            result['review'], result['issues'] = review, issues
             if not issues or round_:
                 break
             await status(f'Дорабатываю слайды: {", ".join(map(str, sorted(issues)))}…')
+            repaired = sorted(issues)
 
             def repair_prompt(spec, issues=issues):
                 return prompt_for(spec, '\nИСПРАВЬ ВЁРСТКУ ЭТОГО СЛАЙДА по замечаниям проверки готового рендера. '
+                                  'Image 2 — рендер твоей текущей версии, как его видит зритель: найди на нём '
+                                  'каждое замечание и другие видимые дефекты. '
                                   'Сохрани тексты, форму, иконки и иллюстрацию.\nЗАМЕЧАНИЯ:\n- '
                                   + '\n- '.join(issues[spec.number])
                                   + '\nPREVIOUS_SLIDE\n' + markups[spec.number].model_dump_json())
-            markups.update(await self._slides(folder, plan, sorted(issues), repair_prompt, pictures,
-                                              background, suffix='-repair'))
+
+            def render_of(n):
+                return [('Image 2: current render of this slide.',
+                         (folder / f'preview-slide-{n}.png').read_bytes(), 'image/png')]
+            markups.update(await self._slides(folder, plan, repaired, repair_prompt, pictures,
+                                              background, suffix='-repair', extra_for=render_of))
         if any(s['issues'] for s in result['textBounds']):
             raise ValueError('Текст выходит за границы слайдов: ' + json.dumps(result['textBounds'], ensure_ascii=False)[:3000])
         write(completed, {'html_sha256': sha(final_html.read_bytes()), 'pptx_sha256': sha(final_pptx.read_bytes()),

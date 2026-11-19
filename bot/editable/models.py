@@ -83,6 +83,11 @@ class Deck(BaseModel):
     images:list[Illustration] = Field(default_factory=list, max_length=3)
 
 
+class SlideReview(BaseModel):
+    """Visible layout defects a reviewer found on a rendered slide; empty when it is fine."""
+    problems:list[str] = Field(default_factory=list, max_length=4)
+
+
 class SlideMarkup(BaseModel):
     """One slide laid out by the model; the code assembles and scopes the deck."""
     css:str
