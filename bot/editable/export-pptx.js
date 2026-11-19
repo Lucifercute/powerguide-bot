@@ -321,20 +321,28 @@ function textObjects(node,root){
  for(let i=0;i<node.length;i++){
   const range=document.createRange();range.setStart(node,i);range.setEnd(node,i+1);const r=range.getBoundingClientRect();
   if(!r.height||!r.width){if(line&&/\s/.test(node.textContent[i]))line.text+=' ';continue;}
-  if(!line||Math.abs(line.y-r.y)>2){line={text:'',x:r.x,y:r.y,right:r.right,h:r.height};lines.push(line);}
+  if(!line||Math.abs(line.y-r.y)>2){
+   // A browser break between two letters splits a word (overflow-wrap), a layout defect.
+   const broken=!!line&&/[\p{L}\p{N}]/u.test(node.textContent[i-1]||'')&&/[\p{L}\p{N}]/u.test(node.textContent[i]);
+   line={text:'',x:r.x,y:r.y,right:r.right,h:r.height,broken};lines.push(line);}
   line.text+=node.textContent[i];line.right=Math.max(line.right,r.right);
  }
  const font=c.fontFamily.split(',')[0].replace(/["']/g,'');
  const base={type:'text',fontSize:parseFloat(c.fontSize)*fontScale,font:/system|-apple|BlinkMac/i.test(font)?'Arial':font,bold:parseInt(c.fontWeight)>=600,italic:c.fontStyle==='italic',color:svgMatrix?(color(c.fill)||color(c.color)):color(c.color),spacing:parseFloat(c.letterSpacing)||0};
- const kept=lines.filter(l=>l.text.trim()).map(l=>{let text=l.text.replace(/\s+/g,' ').trim();if(c.textTransform==='uppercase')text=text.toUpperCase();if(c.textTransform==='lowercase')text=text.toLowerCase();return {...l,text};});
- if(kept.length===1||svgMatrix){
-  for(const line of kept)objects.push({...base,text:line.text,x:line.x-root.x,y:line.y-root.y,w:line.right-line.x+5,h:line.h});
- }else if(kept.length){
-  const left=Math.min(...kept.map(l=>l.x)),right=Math.max(...kept.map(l=>l.right)),first=kept[0],last=kept.at(-1);
-  const pitch=(last.y-first.y)/(kept.length-1),top=first.y-(pitch-first.h)/2;
-  const align=/center/.test(c.textAlign)?'ctr':/right|end/.test(c.textAlign)?'r':'l';
-  objects.push({...base,text:kept.map(l=>l.text).join(' '),lines:kept.map(l=>l.text),pitch,align,
-   x:left-root.x,y:top-root.y,w:right-left+5,h:pitch*kept.length});
+ const cased=s=>c.textTransform==='uppercase'?s.toUpperCase():c.textTransform==='lowercase'?s.toLowerCase():s;
+ const kept=lines.filter(l=>l.text.trim()).map(l=>({...l,text:cased(l.text.replace(/\s+/g,' '))}));
+ const align=/center/.test(c.textAlign)?'ctr':/right|end/.test(c.textAlign)?'r':'l';
+ // Lines join one box only when they share the paragraph edge. The first line of a run
+ // that continues after inline text (bold label, highlight) starts mid-line and stays apart.
+ const edge=l=>align==='l'?l.x:align==='r'?l.right:(l.x+l.right)/2;
+ const groups=[];
+ for(const l of kept){const g=groups.at(-1);if(g&&!svgMatrix&&Math.abs(edge(g.at(-1))-edge(l))<=2)g.push(l);else groups.push([l]);}
+ for(const g of groups){
+  const broken=g.some(l=>l.broken);
+  if(g.length===1){const l=g[0];objects.push({...base,text:l.text,x:l.x-root.x,y:l.y-root.y,w:l.right-l.x+5,h:l.h,broken});continue;}
+  const left=Math.min(...g.map(l=>l.x)),right=Math.max(...g.map(l=>l.right)),first=g[0],last=g.at(-1);
+  const pitch=(last.y-first.y)/(g.length-1),top=first.y-(pitch-first.h)/2,texts=g.map(l=>l.text.trim());
+  objects.push({...base,text:texts.join(' '),lines:texts,pitch,align,x:left-root.x,y:top-root.y,w:right-left+5,h:pitch*g.length,broken});
  }
  return applyOpacity(objects,opacityOf(el));
 }

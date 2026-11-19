@@ -31,8 +31,11 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             .slide{{width:1600px;height:900px;position:relative;background:#fff;font-family:Arial}}
             h1{{position:absolute;left:80px;top:40px;margin:0;font-size:48px}}
             p{{position:absolute;left:80px;top:200px;width:500px;margin:0;font-size:24px;line-height:36px}}
-            small{{position:absolute;left:80px;top:500px;font-size:12px}}</style></head><body><div id="presentation-viewport">
-            <section class="slide" data-slide="1" data-visual-type="text"><h1>Заголовок</h1><p>{words}</p><small>мелко</small></section>
+            small{{position:absolute;left:80px;top:500px;font-size:12px}}
+            .mix{{left:800px;top:200px;width:500px}}
+            h2{{position:absolute;left:800px;top:600px;width:220px;margin:0;font-size:60px;overflow-wrap:anywhere}}</style></head><body><div id="presentation-viewport">
+            <section class="slide" data-slide="1" data-visual-type="text"><h1>Заголовок</h1><p>{words}</p><small>мелко</small>
+            <p class="mix"><b>Метка:</b> {words}</p><h2>ПРОЕКТИРОВАНИЕ</h2></section>
             </div><script>POWERGUIDE_EXPORT_CONFIG={{width:1600,height:900,slideCount:1}};
             POWERGUIDE_PPTX_TEMPLATE={json.dumps(template(1,1600,900))};</script><script>{exporter.read_text()}</script></body></html>'''
         with tempfile.TemporaryDirectory() as directory:
@@ -41,11 +44,15 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             with ZipFile(p/'test.pptx') as z:
                 xml = z.read('ppt/slides/slide1.xml').decode()
             # The wrapped paragraph keeps its lines as breaks inside a single text box.
-            self.assertEqual(xml.count('txBox="1"'), 3)
+            # title, paragraph, small; label, its continuation line, the rest of that paragraph; the broken title (one box)
+            self.assertEqual(xml.count('txBox="1"'), 3 + 3 + 1)
+            label_end = xml.index('Метка:')
+            continuation = xml.index('<a:t xml:space="preserve"> длинный', label_end)
+            self.assertGreater(continuation, label_end)
             self.assertGreaterEqual(xml.count('<a:br>'), 2)
             self.assertIn('<a:spcPts val="2160"/>', xml)
             self.assertTrue(any('Кегль ниже минимума' in h for h in result['issues'][1]))
-            self.assertTrue(any('свободной зоны' in h for h in result['issues'][1]))
+            self.assertTrue(any('разорвано' in h for h in result['issues'][1]))
 
 
 if __name__ == '__main__':

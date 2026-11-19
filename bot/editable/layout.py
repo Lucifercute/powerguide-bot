@@ -46,6 +46,10 @@ def slide_issues(result) -> dict:
             add(row['slide'], f'Кегль ниже минимума {MIN_FONT_PX} px: '
                 + json.dumps(row['items'][:6], ensure_ascii=False) + '. Подними кегль, при нехватке места — '
                 'перестрой композицию или сократи отступы.')
+    for row in result.get('brokenWords', []):
+        if row['items']:
+            add(row['slide'], 'Слово разорвано переносом посередине: ' + json.dumps(row['items'][:3], ensure_ascii=False)
+                + '. Блоку не хватает ширины: расширь колонку или уменьши кегль в пределах паспорта.')
     for issue in result.get('layoutIssues', []):
         add(issue['slide'], issue['hint'])
     for issue in result.get('compositionIssues', []):

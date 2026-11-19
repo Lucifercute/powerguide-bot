@@ -111,6 +111,7 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                         backgroundCrops:scene.map(s=>s.objects.find(o=>o.type==='image')?.crop),
                         textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)})),
                         smallText:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.fontSize<minFont-.5).map(o=>[o.text.slice(0,40),Math.round(o.fontSize)])})),
+                        brokenWords:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.broken).map(o=>o.text.slice(0,60))})),
                         layout:scene.map(s=>s.layout)};
                     })()''')
                     data = base64.b64decode(result.pop('pptx'))
