@@ -50,6 +50,11 @@ def slide_issues(result) -> dict:
         if row['items']:
             add(row['slide'], 'Слово разорвано переносом посередине: ' + json.dumps(row['items'][:3], ensure_ascii=False)
                 + '. Блоку не хватает ширины: расширь колонку или уменьши кегль в пределах паспорта.')
+    for row in result.get('wordFit', []):
+        if row.get('failed'):
+            add(row['slide'], 'Слово не помещается в свой блок даже при уменьшенном кегле: '
+                + json.dumps([w for w, *_ in row['failed'][:3]], ensure_ascii=False)
+                + '. Расширь блок или колонку под самое длинное слово; кегль — в пределах паспорта.')
     for issue in result.get('layoutIssues', []):
         add(issue['slide'], issue['hint'])
     for issue in result.get('compositionIssues', []):

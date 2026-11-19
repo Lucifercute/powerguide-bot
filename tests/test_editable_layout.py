@@ -33,9 +33,10 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             p{{position:absolute;left:80px;top:200px;width:500px;margin:0;font-size:24px;line-height:36px}}
             small{{position:absolute;left:80px;top:500px;font-size:12px}}
             .mix{{left:800px;top:200px;width:500px}}
-            h2{{position:absolute;left:800px;top:600px;width:220px;margin:0;font-size:60px;overflow-wrap:anywhere}}</style></head><body><div id="presentation-viewport">
+            h2{{position:absolute;left:800px;top:600px;width:220px;margin:0;font-size:60px;overflow-wrap:anywhere}}
+            h3{{position:absolute;left:80px;top:700px;width:400px;margin:0;font-size:44px;font-weight:700;word-break:break-all}}</style></head><body><div id="presentation-viewport">
             <section class="slide" data-slide="1" data-visual-type="text"><h1>Заголовок</h1><p>{words}</p><small>мелко</small>
-            <p class="mix"><b>Метка:</b> {words}</p><h2>ПРОЕКТИРОВАНИЕ</h2></section>
+            <p class="mix"><b>Метка:</b> {words}</p><h2>ПРОЕКТИРОВАНИЕ</h2><h3>ПРОЕКТИРОВАНИЕ</h3></section>
             </div><script>POWERGUIDE_EXPORT_CONFIG={{width:1600,height:900,slideCount:1}};
             POWERGUIDE_PPTX_TEMPLATE={json.dumps(template(1,1600,900))};</script><script>{exporter.read_text()}</script></body></html>'''
         with tempfile.TemporaryDirectory() as directory:
@@ -44,15 +45,22 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             with ZipFile(p/'test.pptx') as z:
                 xml = z.read('ppt/slides/slide1.xml').decode()
             # The wrapped paragraph keeps its lines as breaks inside a single text box.
-            # title, paragraph, small; label, its continuation line, the rest of that paragraph; the broken title (one box)
-            self.assertEqual(xml.count('txBox="1"'), 3 + 3 + 1)
+            # title, paragraph, small; label, its continuation line, the rest of that paragraph; two one-word titles
+            self.assertEqual(xml.count('txBox="1"'), 3 + 3 + 2)
             label_end = xml.index('Метка:')
             continuation = xml.index('<a:t xml:space="preserve"> длинный', label_end)
             self.assertGreater(continuation, label_end)
             self.assertGreaterEqual(xml.count('<a:br>'), 2)
             self.assertIn('<a:spcPts val="2160"/>', xml)
             self.assertTrue(any('Кегль ниже минимума' in h for h in result['issues'][1]))
-            self.assertTrue(any('разорвано' in h for h in result['issues'][1]))
+            # Words are never split. A word that fits at a smaller font is fixed in place;
+            # one that cannot fit above the floor goes back to the model.
+            self.assertFalse(any('разорвано' in h for h in result['issues'][1]))
+            fit = result['wordFit'][0]
+            self.assertEqual([w[0] for w in fit['fitted']], ['ПРОЕКТИРОВАНИЕ'])
+            self.assertLess(fit['fitted'][0][2], 44)
+            self.assertEqual([w[0] for w in fit['failed']], ['ПРОЕКТИРОВАНИЕ'])
+            self.assertTrue(any('не помещается' in h for h in result['issues'][1]))
 
 
 if __name__ == '__main__':

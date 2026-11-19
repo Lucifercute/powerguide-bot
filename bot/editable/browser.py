@@ -101,8 +101,8 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                             await asyncio.sleep(.1)
                     result = await cdp.evaluate('''(async()=>{
                       if([...document.images].some(i=>!i.complete||!i.naturalWidth))throw Error('Broken image');
-                      const scene=await PowerGuidePptx.collectSlides(), cfg=POWERGUIDE_EXPORT_CONFIG;
-                      const minFont=''' + str(MIN_FONT_PX) + '''*cfg.width/1600;
+                      const cfg=POWERGUIDE_EXPORT_CONFIG, minFont=''' + str(MIN_FONT_PX) + '''*cfg.width/1600;
+                      const scene=await PowerGuidePptx.collectSlides({minFont});
                       const result=PowerGuidePptx.buildPptx(scene,POWERGUIDE_PPTX_TEMPLATE);
                       let binary='';for(let i=0;i<result.bytes.length;i+=32768)binary+=String.fromCharCode(...result.bytes.subarray(i,i+32768));
                       return {pptx:btoa(binary),counters:result.counters,
@@ -112,6 +112,7 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                         textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)})),
                         smallText:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.fontSize<minFont-.5).map(o=>[o.text.slice(0,40),Math.round(o.fontSize)])})),
                         brokenWords:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.broken).map(o=>o.text.slice(0,60))})),
+                        wordFit:scene.map((s,i)=>({slide:i+1,...s.fit})),
                         layout:scene.map(s=>s.layout)};
                     })()''')
                     data = base64.b64decode(result.pop('pptx'))

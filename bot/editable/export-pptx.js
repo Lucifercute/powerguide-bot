@@ -404,8 +404,50 @@ function measureLayout(slide,objects,number){
  const y0=Math.max(top,Math.min(...body.map(o=>o.y))),y1=Math.min(bottom,Math.max(...body.map(o=>o.y+o.h)));
  return {slide:number,visualType:slide.dataset.visualType,region:{y:Math.round(top),h:Math.round(bottom-top)},content:{y:Math.round(y0),h:Math.round(Math.max(0,y1-y0))}};
 }
-async function collectSlides(){
+// A word wider than its block: shrink that element's font (not below the minimum or 75 % of
+// the original). Words are never split: wrapping inside a word is disabled for the whole deck.
+const FIT_MARGIN=1.03; // Target after shrinking: PowerPoint sets text slightly wider than Chrome.
+function contentWidth(el){const c=getComputedStyle(el);return el.clientWidth-parseFloat(c.paddingLeft)-parseFloat(c.paddingRight);}
+function widestWord(el){
+ let width=0,word='';
+ for(const n of el.childNodes){
+  if(n.nodeType!==3)continue;
+  for(const m of n.textContent.matchAll(/\S+/g)){
+   const r=document.createRange();r.setStart(n,m.index);r.setEnd(n,m.index+m[0].length);
+   const w=r.getBoundingClientRect().width;if(w>width){width=w;word=m[0];}
+  }
+ }
+ return [width,word];
+}
+function fitWords(slide,minFont){
+ const fitted=[],failed=[];
+ const holders=Array.from(slide.querySelectorAll('*')).filter(el=>!el.closest('svg')&&Array.from(el.childNodes).some(n=>n.nodeType===3&&n.textContent.trim()));
+ for(const el of holders){
+  const c=getComputedStyle(el);if(c.display==='none'||c.visibility==='hidden'||c.whiteSpace.startsWith('nowrap')||c.whiteSpace==='pre')continue;
+  let box=el;while(box!==slide&&getComputedStyle(box).display.startsWith('inline')&&box.parentElement)box=box.parentElement;
+  let avail=contentWidth(box);
+  // Flex and grid items grow to their longest word; the parent's width is the real limit.
+  const parent=box.parentElement;
+  if(box!==slide&&parent&&/flex|grid/.test(getComputedStyle(parent).display))avail=Math.min(avail,contentWidth(parent));
+  if(avail<=0)continue;
+  let [w,word]=widestWord(el);if(w<=avail+.5)continue; // shrink-to-fit boxes are exactly as wide as their text
+  const original=parseFloat(c.fontSize),floor=Math.max(minFont,original*.75);let size=original;
+  for(let i=0;i<4&&w*FIT_MARGIN>avail&&size>floor+.1;i++){
+   size=Math.max(floor,size*avail/(w*FIT_MARGIN));el.style.setProperty('font-size',size.toFixed(2)+'px','important');
+   [w]=widestWord(el);
+  }
+  (w<=avail+.5?fitted:failed).push([word.slice(0,40),Math.round(original),Math.round(size)]);
+ }
+ return {fitted,failed};
+}
+async function collectSlides(options={}){
  normalizeFonts();
+ if(!document.getElementById('pg-no-word-split')){
+  const s=document.createElement('style');s.id='pg-no-word-split';
+  s.textContent='section.slide,section.slide *{overflow-wrap:normal!important;word-wrap:normal!important;word-break:normal!important;hyphens:manual!important}';
+  document.head.appendChild(s);
+ }
+ const minFont=options.minFont??20*W/1600;
  await document.fonts.ready;
  await Promise.all(Array.from(document.images).map(i=>i.decode().catch(()=>{})));
  const slides=Array.from(document.querySelectorAll('section.slide')),viewport=document.getElementById('presentation-viewport');
@@ -418,6 +460,7 @@ async function collectSlides(){
   for(const slide of slides)slide.style.cssText+=`;display:${slideDisplay}!important;width:${W}px!important;height:${H}px!important;transform:none!important;flex-shrink:0!important;`;
   const results=[];
   for(const slide of slides){
+   const fit=fitWords(slide,minFont);
    const root=slide.getBoundingClientRect(),objects=[];
    const bg=getComputedStyle(slide).backgroundImage;
    const raster=bg.match(/^url\(["']?(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)["']?\)$/);
@@ -443,7 +486,7 @@ async function collectSlides(){
     for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
+   results.push({background:visibleBackground(slide),objects,fit,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}
