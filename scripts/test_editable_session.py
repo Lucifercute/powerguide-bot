@@ -42,7 +42,9 @@ async def main(args):
     await db.conn.execute('INSERT OR IGNORE INTO sessions(id,user_id) VALUES (?,0)',(args.session,));await db.conn.commit()
     for kind,content,model in artifacts:await db.save_artifact(args.session,kind,content,model)
     for key,question,answer in answers:await db.save_answer(args.session,key,question,answer)
-    llm=TextLLM(config.gemini_api_key,config.gemini_text_models,config.vertex_api_key,config.vertex_text_models)
+    # Same model choice as the bot: dedicated editable models when configured.
+    llm=(TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_text_models)) if config.editable_text_models
+         else TextLLM(config.gemini_api_key,config.gemini_text_models,config.vertex_api_key,config.vertex_text_models))
     images=ImageLLM(config.vertex_api_key,config.image_models)
     started=time.time()
     state=out/'run-state.json';write(state,{'status':'running','pid':os.getpid(),'source_session':args.session})
@@ -59,7 +61,8 @@ async def main(args):
             meta=json.loads((baseline_source.parent/'completed.json').read_text())
             try:await render(baseline/'presentation.html',baseline/'presentation.pptx',meta['slides'],meta['width'],meta['height'])
             except ValueError as e:write(baseline/'validation.txt',str(e));print('Baseline:',str(e)[:250],flush=True)
-        service=EditableService(llm,images,config.prompts_dir,presets_dir=config.presets_dir)
+        service=EditableService(llm,images,config.prompts_dir,presets_dir=config.presets_dir,
+                                thinking=config.editable_thinking,parallel=config.editable_parallel)
         source,output=await service.generate(db,args.session,out/'data/sessions',status)
         await db.finish_session(args.session)
         write(state,{'status':'completed','source_session':args.session,'html':str(source),'pptx':str(output),
