@@ -55,6 +55,10 @@ def slide_issues(result) -> dict:
             add(row['slide'], 'Слово не помещается в свой блок даже при уменьшенном кегле: '
                 + json.dumps([w for w, *_ in row['failed'][:3]], ensure_ascii=False)
                 + '. Расширь блок или колонку под самое длинное слово; кегль — в пределах паспорта.')
+    for row in result.get('missingNodes', []):
+        if row.get('items'):
+            add(row['slide'], 'Код не нашёл узлы для связей: ' + ', '.join(dict.fromkeys(row['items']))
+                + '. Каждому узлу связей нужен элемент data-node="ID узла" внутри data-infographic.')
     for row in result.get('collisions', []):
         if row.get('text'):
             add(row['slide'], 'Тексты наезжают друг на друга: ' + json.dumps(row['text'][:4], ensure_ascii=False)

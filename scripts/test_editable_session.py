@@ -54,7 +54,7 @@ async def main(args):
         if args.audit_baseline and baseline_source.exists() and not (out/'baseline/export-check.json').exists():
             baseline=out/'baseline';baseline.mkdir(exist_ok=True)
             doc=html_parser.document_fromstring(baseline_source.read_text())
-            scripts=[s for s in doc.xpath('//script') if 'function collectSlides()' in (s.text or '')]
+            scripts=[s for s in doc.xpath('//script') if 'function collectSlides(' in (s.text or '')]
             if len(scripts)!=1:raise ValueError('Cannot find the baseline exporter')
             scripts[0].text=Path('bot/editable/export-pptx.js').read_text()
             (baseline/'presentation.html').write_text('<!DOCTYPE html>\n'+html_parser.tostring(doc,encoding='unicode'))

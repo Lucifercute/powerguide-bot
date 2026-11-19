@@ -114,6 +114,7 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                         brokenWords:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.broken).map(o=>o.text.slice(0,60))})),
                         wordFit:scene.map((s,i)=>({slide:i+1,...s.fit})),
                         collisions:scene.map((s,i)=>({slide:i+1,...s.collisions})),
+                        missingNodes:scene.map((s,i)=>({slide:i+1,items:s.missingNodes})),
                         layout:scene.map(s=>s.layout)};
                     })()''')
                     data = base64.b64decode(result.pop('pptx'))

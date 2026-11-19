@@ -24,7 +24,7 @@ from .browser import chrome_path, render
 from .html import assemble, normalize_markup, package, slide_contract, validate_markup, validate_plan
 from .models import SlideMarkup, VisualPlan
 
-EXPORT_VERSION = 10
+EXPORT_VERSION = 11
 THINKING = {'low': types.ThinkingLevel.LOW, 'medium': types.ThinkingLevel.MEDIUM, 'high': types.ThinkingLevel.HIGH}
 # Pro with deep reasoning spends a large part of the budget on thoughts.
 MAX_OUTPUT_TOKENS = 65536
