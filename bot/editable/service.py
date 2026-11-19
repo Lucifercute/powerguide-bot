@@ -64,12 +64,14 @@ def image_data(path):
 
 class EditableService:
     def __init__(self, llm, images, prompts_dir=Path('prompts'), *, prompt_set=None, presets_dir=Path('presets'),
-                 thinking='low', parallel=6, reviewer=None, planner=None, plan_thinking=None):
+                 thinking='low', parallel=6, reviewer=None, planner=None, plan_thinking=None,
+                 review_thinking='low'):
         self.llm, self.images = llm, images
         # The visual plan decides the whole deck: it may use a stronger model and deeper reasoning
         # than the per-slide layout and repairs.
         self.planner = planner or llm
         self.plan_thinking = plan_thinking or thinking
+        self.review_thinking = review_thinking
         # Optional cheap vision model that looks at each rendered slide for visible defects.
         self.reviewer = reviewer
         self.prompts_dir = Path(prompts_dir)
@@ -150,8 +152,8 @@ class EditableService:
         specs = {s.number: s for s in plan.slides}
         gate = asyncio.Semaphore(self.parallel)
         config = types.GenerateContentConfig(
-            response_mime_type='application/json', response_schema=SlideReview, max_output_tokens=4096,
-            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW))
+            response_mime_type='application/json', response_schema=SlideReview, max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level=THINKING[self.review_thinking]))
 
         async def one(n):
             path = folder / f'review-{n}-r{round_ + 1}.json'

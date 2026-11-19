@@ -33,6 +33,7 @@ class Config:
     editable_plan_thinking: str = "low"
     # Vision model that reviews rendered slides (empty = no review).
     editable_review_models: tuple[str, ...] = ()
+    editable_review_thinking: str = "low"
 
 
 def _required(name: str) -> str:
@@ -80,6 +81,7 @@ def load_config() -> Config:
         editable_plan_thinking=_thinking(os.getenv("EDITABLE_PLAN_THINKING", "")
                                          or os.getenv("EDITABLE_THINKING", "low"), "EDITABLE_PLAN_THINKING"),
         editable_review_models=tuple(_split(os.getenv("EDITABLE_REVIEW_MODELS", ""))),
+        editable_review_thinking=_thinking(os.getenv("EDITABLE_REVIEW_THINKING", "low"), "EDITABLE_REVIEW_THINKING"),
     )
 
 

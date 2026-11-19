@@ -25,5 +25,6 @@ def create_pipeline(config):
     pipeline.editable_service = EditableService(editable_llm, pipeline.images, config.prompts_dir,
                                                 presets_dir=config.presets_dir, thinking=config.editable_thinking,
                                                 parallel=config.editable_parallel, reviewer=reviewer,
-                                                planner=planner, plan_thinking=config.editable_plan_thinking)
+                                                planner=planner, plan_thinking=config.editable_plan_thinking,
+                                                review_thinking=config.editable_review_thinking)
     return pipeline

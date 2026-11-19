@@ -66,7 +66,8 @@ async def main(args):
                                 reviewer=TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_review_models))
                                 if config.editable_review_models else None,
                                 planner=TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_plan_models))
-                                if config.editable_plan_models else None,plan_thinking=config.editable_plan_thinking)
+                                if config.editable_plan_models else None,plan_thinking=config.editable_plan_thinking,
+                                review_thinking=config.editable_review_thinking)
         source,output=await service.generate(db,args.session,out/'data/sessions',status)
         await db.finish_session(args.session)
         write(state,{'status':'completed','source_session':args.session,'html':str(source),'pptx':str(output),
