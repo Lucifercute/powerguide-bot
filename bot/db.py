@@ -1,7 +1,7 @@
 from pathlib import Path
 from contextlib import asynccontextmanager
 import asyncio
-import fcntl
+from bot.filelock import lock as file_lock
 
 import aiosqlite
 
@@ -69,7 +69,7 @@ class Database:
         if migrate:
             # API, bot and worker may start together against a fresh database.
             with self.path.with_suffix('.migration.lock').open('a') as lock:
-                await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)
+                await asyncio.to_thread(file_lock, lock)
                 await self._conn.execute("PRAGMA journal_mode = WAL")
                 await self._conn.executescript(SCHEMA)
                 await self._migrate()

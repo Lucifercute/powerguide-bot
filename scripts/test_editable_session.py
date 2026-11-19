@@ -6,7 +6,7 @@ No Telegram delivery, production DB writes or hand-authored model output.
 """
 import argparse
 import asyncio
-import fcntl
+from bot.filelock import lock as file_lock
 import json
 import logging
 import os
@@ -81,5 +81,5 @@ if __name__=='__main__':
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('google_genai.models').setLevel(logging.WARNING)
     with (args.output/'.run.lock').open('a+') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        file_lock(lock,blocking=False)
         asyncio.run(main(args))

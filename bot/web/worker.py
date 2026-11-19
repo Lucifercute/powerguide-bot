@@ -4,7 +4,7 @@ Run with: uv run python -m bot.web.worker
 The OS lock prevents two workers from recovering each other's live tasks.
 """
 import asyncio
-import fcntl
+from bot.filelock import lock as file_lock
 import logging
 from pathlib import Path
 
@@ -117,7 +117,7 @@ class Worker:
         self.settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.settings.db_path.with_suffix('.worker.lock').open('w') as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                file_lock(lock, blocking=False)
             except BlockingIOError:
                 raise RuntimeError('Обработчик заданий уже запущен для этой базы') from None
             db = Database(self.settings.db_path)

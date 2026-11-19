@@ -500,11 +500,11 @@ def create_app(settings: WebSettings | None = None):
             await owned(db, sid, user)
             await cancel(db, sid)
             await db.save_artifact(sid, 'delete_requested', '1')
-        import fcntl
         from bot.web.storage import cleanup_deleted
+        from bot.filelock import lock as file_lock
         with settings.db_path.with_suffix('.worker.lock').open('a') as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                file_lock(lock, blocking=False)
             except BlockingIOError:
                 pass  # Live worker removes the files after its task has stopped.
             else:
