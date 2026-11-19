@@ -440,6 +440,74 @@ function fitWords(slide,minFont){
  }
  return {fitted,failed};
 }
+// Collisions the model cannot see without a render: text over text, text panels overlapping
+// each other, connectors that leave one node and end in empty space.
+function overlapArea(a,b){return Math.max(0,Math.min(a.right,b.right)-Math.max(a.left,b.left))*Math.max(0,Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top));}
+function distanceTo(p,r){return Math.hypot(Math.max(r.left-p[0],0,p[0]-r.right),Math.max(r.top-p[1],0,p[1]-r.bottom));}
+function visibleEl(el){for(let e=el;e;e=e.parentElement){const c=getComputedStyle(e);if(c.visibility==='hidden'||parseFloat(c.opacity)<.1)return false;}return true;}
+function measureCollisions(slide){
+ const short=s=>s.replace(/\s+/g,' ').trim().slice(0,40);
+ const lines=[],walker=document.createTreeWalker(slide,NodeFilter.SHOW_TEXT);let n;
+ while((n=walker.nextNode())){
+  if(!n.textContent.trim()||!visibleEl(n.parentElement))continue;
+  const r=document.createRange();r.selectNodeContents(n);
+  for(const b of r.getClientRects())if(b.width>2&&b.height>2)lines.push({n,b});
+ }
+ const text=[],seen=new Set();
+ for(let i=0;i<lines.length;i++)for(let j=i+1;j<lines.length;j++){
+  const a=lines[i],b=lines[j];if(a.n===b.n)continue;
+  const area=overlapArea(a.b,b.b),smaller=Math.min(a.b.width*a.b.height,b.b.width*b.b.height);
+  if(area>smaller*.2){const key=short(a.n.textContent)+'|'+short(b.n.textContent);if(!seen.has(key)){seen.add(key);text.push([short(a.n.textContent),short(b.n.textContent)]);}}
+ }
+ const slideArea=slide.clientWidth*slide.clientHeight;
+ // Boxes: elements with their own fill or border, smaller than 40 % of the slide.
+ const boxes=Array.from(slide.querySelectorAll('*')).filter(el=>{
+  if(el.closest('svg')||!visibleEl(el))return false;
+  const c=getComputedStyle(el),r=el.getBoundingClientRect();
+  const filled=!/^(transparent|rgba\(.*,\s*0\))$/.test(c.backgroundColor)||c.backgroundImage!=='none';
+  const bordered=['Top','Right','Bottom','Left'].some(s=>parseFloat(c[`border${s}Width`])>0&&c[`border${s}Style`]!=='none');
+  return (filled||bordered)&&r.width>4&&r.height>4&&r.width*r.height<slideArea*.4;
+ });
+ const panels=boxes.filter(el=>el.innerText?.trim());
+ // A text line partly covered by a panel it does not belong to (a label under a pill).
+ for(const l of lines)for(const p of panels){
+  if(p.contains(l.n))continue;
+  const r=p.getBoundingClientRect(),w=Math.min(r.right,l.b.right)-Math.max(r.left,l.b.left),h=Math.min(r.bottom,l.b.bottom)-Math.max(r.top,l.b.top);
+  if(w>4&&h>l.b.height*.4){const key=short(l.n.textContent)+'|'+short(p.innerText);if(!seen.has(key)){seen.add(key);text.push([short(l.n.textContent),short(p.innerText)]);}}
+ }
+ const panelHits=[];
+ for(let i=0;i<panels.length;i++)for(let j=i+1;j<panels.length;j++){
+  const a=panels[i],b=panels[j];if(a.contains(b)||b.contains(a))continue;
+  const ra=a.getBoundingClientRect(),rb=b.getBoundingClientRect();
+  const w=Math.min(ra.right,rb.right)-Math.max(ra.left,rb.left),h=Math.min(ra.bottom,rb.bottom)-Math.max(ra.top,rb.top);
+  if(w>3&&h>3)panelHits.push([short(a.innerText),short(b.innerText)]);
+ }
+ // Connector: a stroked SVG line outside icons, at least 40 px long. One end on a node and the
+ // other more than 24 px from any node means the arrow points into empty space.
+ const svgShapes=Array.from(slide.querySelectorAll('svg circle, svg ellipse, svg rect')).filter(el=>!el.closest('svg[data-icon]'));
+ const targets=[...boxes,...lines.map(l=>l.n.parentElement),...slide.querySelectorAll('svg[data-icon],img'),...svgShapes].map(el=>el.getBoundingClientRect())
+  .concat(lines.map(l=>l.b));
+ const connectors=[];
+ for(const el of slide.querySelectorAll('svg path, svg line, svg polyline')){
+  if(el.closest('svg[data-icon]')||el.closest('defs,marker,clipPath,mask')||!visibleEl(el))continue;
+  const c=getComputedStyle(el);if(c.stroke==='none'||parseFloat(c.strokeWidth)<=0)continue;
+  const total=el.getTotalLength?.();if(!total||total<40)continue;
+  const m=el.getScreenCTM();if(!m)continue;
+  const at=t=>{const q=el.getPointAtLength(t).matrixTransform(m);return[q.x,q.y];};
+  connectors.push({el,ends:[at(0),at(total)],samples:Array.from({length:Math.ceil(total/8)+1},(_,i)=>at(Math.min(total,i*8)))});
+ }
+ // A free end may join another connector (a tree junction); only a gap to both nodes and lines counts.
+ const dangling=[];
+ for(const k of connectors){
+  const gap=p=>Math.min(...targets.map(r=>distanceTo(p,r)),...connectors.filter(o=>o!==k).flatMap(o=>o.samples.map(s=>Math.hypot(s[0]-p[0],s[1]-p[1]))));
+  const gaps=k.ends.map(gap);
+  if(Math.min(...gaps)<=8&&Math.max(...gaps)>24){
+   const free=k.ends[gaps[0]>gaps[1]?0:1],root=slide.getBoundingClientRect();
+   dangling.push([Math.round(free[0]-root.left),Math.round(free[1]-root.top)]);
+  }
+ }
+ return {text,panels:panelHits,dangling};
+}
 async function collectSlides(options={}){
  normalizeFonts();
  if(!document.getElementById('pg-no-word-split')){
@@ -460,7 +528,7 @@ async function collectSlides(options={}){
   for(const slide of slides)slide.style.cssText+=`;display:${slideDisplay}!important;width:${W}px!important;height:${H}px!important;transform:none!important;flex-shrink:0!important;`;
   const results=[];
   for(const slide of slides){
-   const fit=fitWords(slide,minFont);
+   const fit=fitWords(slide,minFont),collisions=measureCollisions(slide);
    const root=slide.getBoundingClientRect(),objects=[];
    const bg=getComputedStyle(slide).backgroundImage;
    const raster=bg.match(/^url\(["']?(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)["']?\)$/);
@@ -486,7 +554,7 @@ async function collectSlides(options={}){
     for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects,fit,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
+   results.push({background:visibleBackground(slide),objects,fit,collisions,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}

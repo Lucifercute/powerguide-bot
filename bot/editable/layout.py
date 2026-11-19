@@ -55,6 +55,17 @@ def slide_issues(result) -> dict:
             add(row['slide'], 'Слово не помещается в свой блок даже при уменьшенном кегле: '
                 + json.dumps([w for w, *_ in row['failed'][:3]], ensure_ascii=False)
                 + '. Расширь блок или колонку под самое длинное слово; кегль — в пределах паспорта.')
+    for row in result.get('collisions', []):
+        if row.get('text'):
+            add(row['slide'], 'Тексты наезжают друг на друга: ' + json.dumps(row['text'][:4], ensure_ascii=False)
+                + '. Разведи элементы: у каждой подписи своё место, не пересекающее другие подписи и плашки.')
+        if row.get('panels'):
+            add(row['slide'], 'Плашки с текстом перекрываются: ' + json.dumps(row['panels'][:4], ensure_ascii=False)
+                + '. Задай им промежуток (gap) и общую сетку вместо ручных координат.')
+        if row.get('dangling'):
+            add(row['slide'], f'Соединительные линии обрываются в пустоте, свободные концы (x, y): {row["dangling"][:4]}. '
+                'Каждая линия должна идти от узла к узлу; координаты линий бери из той же сетки, что и узлы, '
+                'в одной системе координат (SVG viewBox = размеру схемы).')
     for issue in result.get('layoutIssues', []):
         add(issue['slide'], issue['hint'])
     for issue in result.get('compositionIssues', []):

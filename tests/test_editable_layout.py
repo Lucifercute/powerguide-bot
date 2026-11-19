@@ -34,9 +34,10 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             small{{position:absolute;left:80px;top:500px;font-size:12px}}
             .mix{{left:800px;top:200px;width:500px}}
             h2{{position:absolute;left:800px;top:600px;width:220px;margin:0;font-size:60px;overflow-wrap:anywhere}}
-            h3{{position:absolute;left:80px;top:700px;width:400px;margin:0;font-size:44px;font-weight:700;word-break:break-all}}</style></head><body><div id="presentation-viewport">
+            h3{{position:absolute;left:80px;top:700px;width:400px;margin:0;font-size:44px;font-weight:700;word-break:break-all}}
+            i{{position:absolute;left:100px;top:206px;font-size:24px}}</style></head><body><div id="presentation-viewport">
             <section class="slide" data-slide="1" data-visual-type="text"><h1>Заголовок</h1><p>{words}</p><small>мелко</small>
-            <p class="mix"><b>Метка:</b> {words}</p><h2>ПРОЕКТИРОВАНИЕ</h2><h3>ПРОЕКТИРОВАНИЕ</h3></section>
+            <p class="mix"><b>Метка:</b> {words}</p><h2>ПРОЕКТИРОВАНИЕ</h2><h3>ПРОЕКТИРОВАНИЕ</h3><i>наложение</i></section>
             </div><script>POWERGUIDE_EXPORT_CONFIG={{width:1600,height:900,slideCount:1}};
             POWERGUIDE_PPTX_TEMPLATE={json.dumps(template(1,1600,900))};</script><script>{exporter.read_text()}</script></body></html>'''
         with tempfile.TemporaryDirectory() as directory:
@@ -45,8 +46,9 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             with ZipFile(p/'test.pptx') as z:
                 xml = z.read('ppt/slides/slide1.xml').decode()
             # The wrapped paragraph keeps its lines as breaks inside a single text box.
-            # title, paragraph, small; label, its continuation line, the rest of that paragraph; two one-word titles
-            self.assertEqual(xml.count('txBox="1"'), 3 + 3 + 2)
+            # title, paragraph, small; label, its continuation line, the rest of that paragraph;
+            # two one-word titles; the overlapping <i>
+            self.assertEqual(xml.count('txBox="1"'), 3 + 3 + 2 + 1)
             label_end = xml.index('Метка:')
             continuation = xml.index('<a:t xml:space="preserve"> длинный', label_end)
             self.assertGreater(continuation, label_end)
@@ -61,6 +63,9 @@ class BrowserLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(fit['fitted'][0][2], 44)
             self.assertEqual([w[0] for w in fit['failed']], ['ПРОЕКТИРОВАНИЕ'])
             self.assertTrue(any('не помещается' in h for h in result['issues'][1]))
+            # <i> sits on top of the first line of the long paragraph.
+            self.assertIn('наложение', [word for pair in result['collisions'][0]['text'] for word in pair])
+            self.assertTrue(any('наезжают' in h for h in result['issues'][1]))
 
 
 if __name__ == '__main__':

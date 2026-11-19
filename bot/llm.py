@@ -62,7 +62,7 @@ def _vertex_client(api_key: str) -> genai.Client:
         vertexai=True,
         api_key=api_key,
         location="global",
-        http_options=types.HttpOptions(timeout=180_000),  # ms
+        http_options=types.HttpOptions(timeout=360_000),  # ms; Pro with high thinking can take 3+ minutes per slide
     )
 
 
@@ -75,7 +75,7 @@ class TextLLM:
     ):
         self.client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=180_000),  # ms
+            http_options=types.HttpOptions(timeout=360_000),  # ms; Pro with high thinking can take 3+ minutes per slide
         )
         self.targets = [_Target(self.client, m, m) for m in models]
         # The File API belongs to the free AI Studio key: only its models can read uploaded files.
