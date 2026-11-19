@@ -1,0 +1,148 @@
+import { test, expect } from '@playwright/test';
+
+// Real HTTP API + temporary SQLite + real worker with explicit TEST model fakes.
+// These fixtures are verification inputs, not a new generation through Google.
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+  test(`drafts, upload, cancellation and deletion at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await page.route('https://telegram.org/**', route => route.abort());
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto('/');
+    await page.getByRole('button', { name: /Открыть локальную версию/ }).click();
+    await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+    // Each browser context starts with its own login, while test cleanup removes its project.
+    await page.screenshot({ path: `../snapshots/miniapp-ui/home-${viewport.width}.png`, fullPage: true });
+    await page.getByRole('button', { name: '＋ Новая презентация', exact: true }).click();
+    await page.getByLabel(/Описание презентации/).fill('Презентация для проверки интерфейса');
+    await page.getByLabel('Что ещё нужно учесть?').fill('Проверяем сохранение черновика');
+    await page.getByRole('button', { name: 'Сохранить черновик' }).click();
+    await expect(page.getByRole('heading', { name: 'Презентация для проверки интерфейса' })).toBeVisible();
+    await page.locator('input[type=file]').setInputFiles({ name: 'facts.txt', mimeType: 'text/plain', buffer: Buffer.from('Материалы теста интерфейса') });
+    await expect(page.getByText('facts.txt')).toBeVisible();
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+    await page.getByRole('button', { name: /ПРОДОЛЖИТЬ РАБОТУ/ }).click();
+    await expect(page.getByLabel(/Описание презентации/)).toHaveValue('Презентация для проверки интерфейса');
+    await expect(page.getByText('facts.txt')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: `../snapshots/miniapp-ui/sources-${viewport.width}.png`, fullPage: true });
+    await page.getByRole('button', { name: 'Отменить презентацию', exact: true }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByRole('button', { name: 'Остановить', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Презентация отменена' })).toBeVisible();
+    await page.getByRole('button', { name: 'Удалить проект и файлы' }).click();
+    await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+}
+
+test('complete creation through real API and worker with TEST model responses', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route('https://telegram.org/**', route => route.abort());
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await page.getByRole('button', { name: /Открыть локальную версию/ }).click();
+  await page.getByRole('button', { name: '＋ Новая презентация', exact: true }).click();
+  await page.getByLabel(/Описание презентации/).fill('ТЕСТ: сквозная проверка приложения');
+  await page.getByRole('button', { name: /Изучить материалы/ }).click();
+  await expect(page.getByRole('heading', { name: 'Проверим, что всё поняли' })).toBeVisible({ timeout: 15000 });
+  await page.getByRole('button', { name: /Подтвердить и подготовить план/ }).click();
+  await expect(page.getByRole('heading', { name: 'Сначала — правильная история' })).toBeVisible({ timeout: 15000 });
+  const slide = page.getByRole('textbox', { name: 'Содержание слайда 1' });
+  await slide.fill('ЗАГОЛОВОК: Тестовая правка\nТИП: текст\nСОДЕРЖАНИЕ: Доход 12,5 млн рублей');
+  await page.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await page.getByRole('button', { name: /План подходит/ }).click();
+  await expect(page.getByRole('heading', { name: 'Выберите настроение' })).toBeVisible();
+  await page.getByRole('button', { name: /Подобрать дизайн автоматически/ }).click();
+  await expect(page.getByRole('heading', { name: 'Основа для ваших слайдов' })).toBeVisible({ timeout: 15000 });
+  await page.getByRole('button', { name: /Принять фон/ }).click();
+  await expect(page.getByRole('heading', { name: 'В каком формате создадим?' })).toBeVisible();
+  await page.getByRole('button', { name: 'Создать презентацию →', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Ваша презентация готова' })).toBeVisible({ timeout: 15000 });
+  await expect(page.getByRole('link', { name: '↓ PDF', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: '↓ PowerPoint', exact: true })).toBeVisible();
+  const pdf = await page.getByRole('link', { name: '↓ PDF', exact: true }).getAttribute('href');
+  const response = await page.request.get(pdf!);
+  expect(response.status()).toBe(200);
+  expect((await response.body()).subarray(0, 4).toString()).toBe('%PDF');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+  await page.getByRole('button', { name: 'Удалить проект и файлы' }).click();
+  await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+});
+
+test('personal invitation logs in automatically, hides token and survives reload', async ({ page }) => {
+  await page.route('https://telegram.org/**', route => route.abort());
+  const fixtureResponse = await page.request.get('/_test/invitation');
+  expect(fixtureResponse.status()).toBe(200);
+  const fixture = await fixtureResponse.json();
+  await page.goto('/#invite=' + fixture.token);
+  await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+  await expect(page.getByText('Друг — тест', { exact: false })).toBeVisible();
+  expect(new URL(page.url()).hash).toBe('');
+  await expect(page.getByRole('button', { name: /Открыть локальную версию/ })).toHaveCount(0);
+  await page.getByRole('button', { name: '＋ Новая презентация', exact: true }).click();
+  await page.getByLabel(/Описание презентации/).fill('Личный черновик тестировщика');
+  await page.getByRole('button', { name: 'Сохранить черновик' }).click();
+  await expect(page.getByRole('heading', { name: 'Личный черновик тестировщика' })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /ПРОДОЛЖИТЬ РАБОТУ/ })).toBeVisible();
+});
+
+test('slide save errors are inline and normalized saves unlock plan without losing other drafts', async ({ page }) => {
+  await page.route('https://telegram.org/**', route => route.abort());
+  await page.goto('/');
+  await page.getByRole('button', { name: /Открыть локальную версию/ }).click();
+  await page.getByRole('button', { name: '＋ Новая презентация', exact: true }).click();
+  await page.getByLabel(/Описание презентации/).fill('ТЕСТ: сохранение правок плана');
+  await page.getByRole('button', { name: /Изучить материалы/ }).click();
+  await expect(page.getByRole('heading', { name: 'Проверим, что всё поняли' })).toBeVisible({ timeout: 15000 });
+  await page.getByRole('button', { name: /Подтвердить и подготовить план/ }).click();
+  const firstText = page.getByRole('textbox', { name: 'Содержание слайда 1', exact: true });
+  const secondText = page.getByRole('textbox', { name: 'Содержание слайда 2', exact: true });
+  const first = page.locator('article').filter({ has: firstText });
+  const second = page.locator('article').filter({ has: secondText });
+  const accept = page.getByRole('button', { name: /План подходит/ });
+  await expect(firstText).toBeVisible({ timeout: 15000 });
+  await firstText.fill('ЗАГОЛОВОК: Новый заголовок\nТИП: инфографика\nСОДЕРЖАНИЕ: Факты');
+  const secondDraft = 'СЛАЙД 2\nЗАГОЛОВОК: Вторая правка\nТИП: текст\nСОДЕРЖАНИЕ: Факты\n\n';
+  await secondText.fill(secondDraft);
+  await first.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await expect(first.getByRole('alert')).toContainText('тип «инфографика» не подходит');
+  await expect(accept).toBeDisabled();
+  await firstText.fill('ЗАГОЛОВОК: Процесс\nТИП: схема\nСОДЕРЖАНИЕ: Старый список пунктов');
+  await first.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await expect(first.getByRole('button', { name: 'Сохранить слайд', exact: true })).toHaveCount(0);
+  await expect(first.getByRole('alert')).toHaveCount(0);
+  await expect(firstText).toHaveValue('ЗАГОЛОВОК: Процесс\nТИП: схема\nСОДЕРЖАНИЕ: Старый список пунктов');
+  await expect(accept).toBeDisabled();
+  const scheme = 'ЗАГОЛОВОК: Процесс\nТИП: схема\nСОДЕРЖАНИЕ:\nФорма: этапы\nБлоки: Подготовка; Проверка; Результат\nСвязи: Подготовка → Проверка → Результат';
+  await firstText.fill(scheme);
+  await first.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await expect(first.getByRole('button', { name: 'Сохранить слайд', exact: true })).toHaveCount(0);
+  await expect(firstText).toHaveValue(scheme);
+  await expect(first.getByRole('alert')).toHaveCount(0);
+  await firstText.fill('\nСЛАЙД 1\nЗАГОЛОВОК: Новый заголовок\nТИП: текст\nСОДЕРЖАНИЕ: Факты\n\n');
+  await first.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await expect(first.getByRole('button', { name: 'Сохранить слайд', exact: true })).toHaveCount(0);
+  await expect(first.getByRole('alert')).toHaveCount(0);
+  await expect(secondText).toHaveValue(secondDraft);
+  await expect(page.getByText('Несохранённые слайды: 2.', { exact: false })).toBeVisible();
+  await second.getByRole('button', { name: 'Сохранить слайд', exact: true }).click();
+  await expect(accept).toBeEnabled();
+  await firstText.fill('Несохранённый текст');
+  await expect(accept).toBeDisabled();
+  await first.getByRole('button', { name: 'Отменить правки', exact: true }).click();
+  await expect(firstText).toHaveValue('ЗАГОЛОВОК: Новый заголовок\nТИП: текст\nСОДЕРЖАНИЕ: Факты');
+  await expect(accept).toBeEnabled();
+  await accept.click();
+  await expect(page.getByRole('heading', { name: 'Выберите настроение' })).toBeVisible();
+  await page.getByRole('button', { name: 'Удалить проект и файлы' }).click();
+  await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Мои презентации' })).toBeVisible();
+});

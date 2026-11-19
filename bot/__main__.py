@@ -6,14 +6,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from bot.config import load_config
+from bot.bootstrap import create_pipeline
 from bot.db import Database
 from bot.handlers import router
-from bot.llm import ImageLLM, TextLLM
-from bot.pipeline import Pipeline
 from bot.presets import PresetStore
 from bot.questions import QuestionBank
-from bot.search import WebSearch
-from bot.editable.service import EditableService
 
 
 async def main() -> None:
@@ -25,22 +22,11 @@ async def main() -> None:
     await db.connect()
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    search = WebSearch(config.tavily_api_key) if config.tavily_api_key else None
-    if search is None:
+    if not config.tavily_api_key:
         logging.warning("TAVILY_API_KEY is not set: step 02 will run without web search")
     if config.libreoffice_path is None:
         logging.warning("LibreOffice not found: Word and PowerPoint files will be read as text only")
-    pipeline = Pipeline(
-        llm=TextLLM(
-            config.gemini_api_key, config.gemini_text_models, config.vertex_api_key, config.vertex_text_models
-        ),
-        images=ImageLLM(config.vertex_api_key, config.image_models),
-        search=search,
-        prompts_dir=config.prompts_dir,
-        max_queries=config.search_max_queries,
-    )
-    pipeline.editable_enabled = config.editable_pptx_enabled
-    pipeline.editable_service = EditableService(pipeline.llm, pipeline.images, config.prompts_dir)
+    pipeline = create_pipeline(config)
     logging.info('Editable PPTX choice enabled: %s; database: %s',
                  config.editable_pptx_enabled, config.db_path.resolve())
     # Values passed here are injected into handlers by parameter name (db, bank, pipeline, files_dir, soffice, presets).
@@ -53,6 +39,23 @@ async def main() -> None:
         presets=PresetStore(config.presets_dir),
     )
     dp.include_router(router)
+
+    import os
+    if os.getenv('PILOT_ENABLED', '0') == '1':
+        from bot.web.settings import WebSettings
+        from bot.web.chat import PilotMiddleware
+        settings = WebSettings.load()
+        middleware = PilotMiddleware(settings)
+        dp.message.outer_middleware(middleware)
+        dp.callback_query.outer_middleware(middleware)
+        if settings.miniapp_url:
+            from aiogram.types import InlineKeyboardButton, WebAppInfo
+            from bot.generation import start_keyboard as result_keyboard
+            from bot.handlers import start_keyboard as greeting_keyboard
+            for keyboard in (greeting_keyboard, result_keyboard):
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text='Открыть приложение', web_app=WebAppInfo(url=settings.miniapp_url))
+                ])
 
     try:
         await dp.start_polling(bot)

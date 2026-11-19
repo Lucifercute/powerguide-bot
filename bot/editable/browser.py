@@ -12,6 +12,7 @@ from zipfile import ZipFile
 import aiohttp
 from lxml import etree
 from pptx import Presentation
+from .composition import composition_issues
 
 
 def chrome_path():
@@ -54,7 +55,9 @@ def validate_pptx(data, count, width, height):
             raise ValueError('Повреждённый PPTX')
         for name in z.namelist():
             if name.endswith(('.xml', '.rels')):
-                etree.fromstring(z.read(name))
+                root = etree.fromstring(z.read(name))
+                if root.xpath('//*[local-name()="prstGeom"][@prst="ellipse"]/*[local-name()="avLst"]/*'):
+                    raise RuntimeError('Экспортёр добавил неподдерживаемую настройку геометрии эллипса')
     p = Presentation(io.BytesIO(data))
     if len(p.slides) != count or abs(p.slide_width / p.slide_height - width / height) > .001:
         raise ValueError('Размер или количество слайдов PPTX не соответствует запросу')
@@ -62,7 +65,7 @@ def validate_pptx(data, count, width, height):
         raise ValueError('Потерян редактируемый текст одного из слайдов')
 
 
-async def render(source: Path, output: Path, count: int, width: int, height: int):
+async def render(source: Path, output: Path, count: int, width: int, height: int, *, previews=False):
     """No API calls. On failure keep HTML; publish PPTX only after validation."""
     with tempfile.TemporaryDirectory(prefix='powerguide-export-', ignore_cleanup_errors=True) as profile:
         process = await asyncio.create_subprocess_exec(
@@ -99,16 +102,34 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                       const result=PowerGuidePptx.buildPptx(scene,POWERGUIDE_PPTX_TEMPLATE);
                       let binary='';for(let i=0;i<result.bytes.length;i+=32768)binary+=String.fromCharCode(...result.bytes.subarray(i,i+32768));
                       return {pptx:btoa(binary),counters:result.counters,
+                        composition:scene.map(s=>s.composition),
+                        fonts:[...new Set(scene.flatMap(s=>s.objects.filter(o=>o.type==='text').map(o=>o.font)))],
+                        backgroundCrops:scene.map(s=>s.objects.find(o=>o.type==='image')?.crop),
                         textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)}))};
                     })()''')
                     data = base64.b64decode(result.pop('pptx'))
+                    result['compositionIssues'] = composition_issues(result.get('composition', []))
                     (source.parent / 'export-check.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
                     if any(s['issues'] for s in result['textBounds']):
                         raise ValueError('Текст выходит за границы слайдов: ' + json.dumps(result['textBounds'], ensure_ascii=False)[:3000])
+                    if result['compositionIssues']:
+                        raise ValueError('Однообразие композиции: ' + json.dumps(result['compositionIssues'], ensure_ascii=False))
                     await asyncio.to_thread(validate_pptx, data, count, width, height)
                     tmp = output.with_suffix('.pptx.tmp')
                     tmp.write_bytes(data)
                     tmp.replace(output)
+                    if previews:
+                        await cdp.evaluate('''(()=>{
+                          document.querySelectorAll('#pg-nav,#export-editable-pptx').forEach(e=>e.style.display='none');
+                          const slides=[...document.querySelectorAll('section.slide')];
+                          globalThis.previewDisplay=getComputedStyle(slides.find(s=>getComputedStyle(s).display!=='none')).display;
+                        })()''')
+                        for index in range(count):
+                            await cdp.evaluate(f'''(()=>{{
+                              [...document.querySelectorAll('section.slide')].forEach((s,i)=>s.style.setProperty('display',i==={index}?previewDisplay:'none','important'));
+                            }})()''')
+                            shot = await cdp.call('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': False})
+                            (source.parent / f'preview-slide-{index + 1}.png').write_bytes(base64.b64decode(shot['data']))
                     return result
         finally:
             if process.returncode is None:

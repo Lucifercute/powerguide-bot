@@ -26,81 +26,91 @@ PDF_FILENAME = "Презентация.pdf"
 start_keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Новая презентация", callback_data="new_presentation")]])
 retry_keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Повторить", callback_data="retry_step")]])
 
-@_running.handle_cancellation
-async def run_slides(
-    message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int
-) -> None:
-    """Everything after the background is accepted, without stops: style (05), slide
-    descriptions (06), slide images (07), then the album and the PDF.
+async def notify(target, text):
+    """Progress callback for the service, or the existing Telegram message adapter."""
+    if callable(target):
+        return await target(text)
+    return await target.answer(text)
 
-    Each result is saved as soon as it's ready, so a retry continues where it stopped:
-    finished slides are not drawn again.
-    """
+
+@_running.handle_cancellation
+async def run_slides(message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int) -> None:
+    paths, pdf, pptx, report = await generate_standard(db, pipeline, files_dir, session_id, message.answer)
+    await send_slides(message, paths, pdf)
+    await message.answer_document(BufferedInputFile(pptx.read_bytes(), filename="Презентация_редактируемая.pptx"))
+    await message.answer(report)
+    await message.answer("Презентация готова!", reply_markup=start_keyboard)
+    await db.finish_session(session_id)
+
+
+async def generate_standard(db, pipeline, files_dir, session_id, progress):
+    """Persist reusable outputs before delivery; no dependency on Telegram."""
     artifacts = await db.get_artifacts(session_id)
     ratio = await session_ratio(db, session_id)
     background = load_image(chosen_background(artifacts))
     try:
         if STYLE not in artifacts:
-            await message.answer("Готовлю стиль оформления слайдов…")
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+            await notify(progress, "Готовлю стиль оформления слайдов…")
             style, model = await pipeline.style(background, ratio)
             await db.save_artifact(session_id, STYLE, style, model)
             artifacts[STYLE] = style
         if DESCRIPTIONS not in artifacts:
-            await message.answer("Продумываю, как показать содержимое каждого слайда…")
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+            await notify(progress, "Продумываю, как показать содержимое каждого слайда…")
             images = await load_user_images(db, session_id)
             descriptions, model = await pipeline.descriptions(artifacts[PLAN.kind], images)
             await db.save_artifact(session_id, DESCRIPTIONS, descriptions, model)
             artifacts[DESCRIPTIONS] = descriptions
     except LLMError as e:
         log.error("Slides preparation failed for session %d: %s", session_id, e)
-        await message.answer(
+        await notify(progress,
             "Нейросеть сейчас не отвечает. Прогресс сохранён — попробуйте ещё раз.",
-            reply_markup=retry_keyboard,
         )
-        return
+        raise LLMError("Не удалось завершить генерацию. Прогресс сохранён.")
 
     try:
         blocks = validate_descriptions(artifacts[PLAN.kind], artifacts[DESCRIPTIONS])
     except LLMError:
         await db.delete_artifact(session_id, DESCRIPTIONS)
-        await message.answer("Описание слайдов неполное. Нажмите «Повторить», чтобы подготовить его заново.", reply_markup=retry_keyboard)
-        return
+        await notify(progress, "Описание слайдов неполное. Нажмите «Повторить», чтобы подготовить его заново.")
+        raise LLMError("Не удалось завершить генерацию. Прогресс сохранён.")
     if len(blocks) > MAX_SLIDES:
-        await message.answer(
+        await notify(progress,
             f"В плане {len(blocks)} слайдов, а в демо-версии можно не больше {MAX_SLIDES}. "
             f"Рисую первые {MAX_SLIDES}."
         )
         blocks = dict(list(blocks.items())[:MAX_SLIDES])
 
-    failed = await draw_slides(message, db, pipeline, files_dir, session_id, blocks, ratio, background)
+    failed = await draw_slides(progress, db, pipeline, files_dir, session_id, blocks, ratio, background)
     if failed:
-        await message.answer(
+        await notify(progress,
             "Не получилось нарисовать слайды: " + ", ".join(map(str, failed)) + ". "
             "Готовые слайды сохранены — «Повторить» дорисует только недостающие.",
-            reply_markup=retry_keyboard,
         )
-        return
+        raise LLMError("Не удалось завершить генерацию. Прогресс сохранён.")
 
-    report = await check_slides_text(message, db, pipeline, session_id, blocks)
+    report = await check_slides_text(progress, db, pipeline, session_id, blocks)
     artifacts = await db.get_artifacts(session_id)
     paths = [Path(artifacts[slide_kind(n)]) for n in blocks]
-    await send_slides(message, paths)
+    folder = files_dir / str(session_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    pdf_path = folder / 'presentation.pdf'
+    pdf_path.write_bytes(await asyncio.to_thread(build_pdf, paths))
+    await db.save_artifact(session_id, 'result_pdf', str(pdf_path))
     editable = await asyncio.to_thread(
         build_editable_pptx, artifacts[PLAN.kind], ratio,
         await load_user_images(db, session_id), list(blocks),
     )
-    await message.answer_document(BufferedInputFile(editable, filename="Презентация_редактируемая.pptx"))
+    pptx_path = folder / 'presentation.pptx'
+    pptx_path.write_bytes(editable)
+    await db.save_artifact(session_id, 'result_pptx', str(pptx_path))
     no_picture = [str(n) for n in blocks if user_image_failed_kind(n) in artifacts]
     if no_picture:
         report += (
             "\n\nНе удалось вставить ваши изображения на слайды: " + ", ".join(no_picture) + ". "
             "Эти слайды нарисованы без них."
         )
-    await message.answer(report)
-    await message.answer("Презентация готова!", reply_markup=start_keyboard)
-    await db.finish_session(session_id)
+    await db.save_artifact(session_id, 'text_report', report)
+    return paths, pdf_path, pptx_path, report
 
 
 def sample_slide(blocks: dict[int, str], with_picture: set[int] = frozenset()) -> int | None:
@@ -134,8 +144,9 @@ async def draw_slides(
     if not missing:
         return []
     done = len(blocks) - len(missing)
-    status = await message.answer(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
-    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+    status = await notify(message, f"Рисую слайды. Готово: {done} из {len(blocks)}…")
+    if not callable(message):
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
     failed: list[int] = []
 
     images = await load_user_images(db, session_id)
@@ -188,7 +199,10 @@ async def draw_slides(
         await db.save_artifact(session_id, slide_kind(number), str(path), model)
         done += 1
         with suppress(TelegramBadRequest):  # e.g. "message is not modified"
-            await status.edit_text(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
+            if callable(message):
+                await message(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
+            else:
+                await status.edit_text(f"Рисую слайды. Готово: {done} из {len(blocks)}…")
         return image
 
     sample_number = sample_slide(blocks, set(images))
@@ -223,8 +237,9 @@ async def check_slides_text(
     artifacts = await db.get_artifacts(session_id)
     unchecked = [n for n in blocks if text_check_kind(n) not in artifacts]
     if unchecked:
-        await message.answer("Проверяю текст на слайдах…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        await notify(message, "Проверяю текст на слайдах…")
+        if not callable(message):
+            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     semaphore = asyncio.Semaphore(TEXT_CHECK_CONCURRENCY)
 
     async def check(number: int) -> None:
@@ -269,7 +284,7 @@ def text_check_report(numbers: list[int], artifacts: dict[str, str]) -> str:
     return text
 
 
-async def send_slides(message: Message, paths: list[Path]) -> None:
+async def send_slides(message: Message, paths: list[Path], pdf_path: Path | None = None) -> None:
     """Slides as photo albums to look through, then the PDF in full quality."""
     for i in range(0, len(paths), TELEGRAM_ALBUM_LIMIT):
         chunk = paths[i : i + TELEGRAM_ALBUM_LIMIT]
@@ -279,5 +294,5 @@ async def send_slides(message: Message, paths: list[Path]) -> None:
         await message.answer_media_group(
             [InputMediaPhoto(media=BufferedInputFile(p.read_bytes(), filename=p.name)) for p in chunk]
         )
-    pdf = await asyncio.to_thread(build_pdf, paths)
+    pdf = pdf_path.read_bytes() if pdf_path else await asyncio.to_thread(build_pdf, paths)
     await message.answer_document(BufferedInputFile(pdf, filename=PDF_FILENAME))

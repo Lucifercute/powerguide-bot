@@ -109,7 +109,8 @@ def _slide_type(raw: str) -> str:
 
 def parse_slide_edit(text: str, number: int) -> str:
     """The user's edited slide N, checked: ЗАГОЛОВОК, ТИП and СОДЕРЖАНИЕ in this order, a known
-    type, a scheme with blocks and links. The «СЛАЙД N» line may be kept or removed.
+    type and nonempty content. Schemes may use ordinary prose: visual structure is
+    developed by the generation stage. The «СЛАЙД N» line may be kept or removed.
     Returns the text without that line; raises SlideFormatError."""
     text = text.strip()
     header = _SLIDE_HEADER.match(text)
@@ -138,6 +139,4 @@ def parse_slide_edit(text: str, number: int) -> str:
     content = text[fields["СОДЕРЖАНИЕ"].start(2) :].strip()
     if not content:
         raise SlideFormatError("содержание пустое.")
-    if kind == "схема" and not ("блоки:" in content.lower() and "связи:" in content.lower()):
-        raise SlideFormatError("у схемы в содержании должны быть «Блоки:» и «Связи:».")
     return text

@@ -44,3 +44,9 @@ service-account*.json
 
 # Owner-specific local assistant permissions
 /AGENTS.md
+
+# Local web builds and tooling
+node_modules/
+*.tsbuildinfo
+frontend/test-results/
+frontend/playwright-report/

@@ -1,5 +1,6 @@
 """A persisted choice between the original generator and editable HTML/PPTX."""
 import logging
+import os
 import re
 from contextlib import suppress
 
@@ -27,17 +28,17 @@ CHOICE_TEXT = (
 
 
 def choice_keyboard(session_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='✏️ Редактируемый PPTX', callback_data=f'genmode:{session_id}:editable')],
-        [InlineKeyboardButton(text='▶️ Стандартная генерация', callback_data=f'genmode:{session_id}:standard')],
-    ])
+    rows = [[InlineKeyboardButton(text='✏️ Редактируемый PPTX', callback_data=f'genmode:{session_id}:editable')]]
+    if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1':
+        rows.append([InlineKeyboardButton(text='▶️ Стандартная генерация', callback_data=f'genmode:{session_id}:standard')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def failed_keyboard(session_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='Повторить', callback_data='retry_step')],
-        [InlineKeyboardButton(text='Перейти к стандартной генерации', callback_data=f'genfallback:{session_id}')],
-    ])
+    rows = [[InlineKeyboardButton(text='Повторить', callback_data='retry_step')]]
+    if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1':
+        rows.append([InlineKeyboardButton(text='Перейти к стандартной генерации', callback_data=f'genfallback:{session_id}')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @_running.handle_cancellation
@@ -60,7 +61,11 @@ async def continue_generation(message, db, pipeline, files_dir, session_id):
         else:
             await db.set_waiting_for(session_id, WAIT_MODE)
             log.info('Session %d: offering generation mode choice', session_id)
-            await message.answer(CHOICE_TEXT, reply_markup=choice_keyboard(session_id))
+            text = CHOICE_TEXT if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1' else (
+                'Подготовить редактируемый PPTX? Текст и элементы схем можно менять в PowerPoint. '
+                'Иллюстрации и фон останутся изображениями. Дополнительно получите HTML.'
+            )
+            await message.answer(text, reply_markup=choice_keyboard(session_id))
             return
     await db.set_waiting_for(session_id, None)
     if mode == 'editable':
@@ -108,6 +113,9 @@ async def on_generation_mode(callback, db, pipeline, files_dir):
     except (ValueError, IndexError):
         return
     if mode not in {'standard', 'editable'}:
+        return
+    if mode == 'standard' and os.getenv('STANDARD_GENERATION_ENABLED', '1') != '1':
+        await callback.message.answer('Стандартный режим больше не доступен для новых генераций.')
         return
     async with _choices[session_id]:
         active = await db.get_active_session(callback.from_user.id)

@@ -52,6 +52,20 @@ class SessionJobs:
         async def wrapped(*args, **kwargs):
             arguments = signature.bind(*args, **kwargs).arguments
             db, session_id = arguments['db'], arguments['session_id']
+            settings = getattr(db, 'queue_settings', None)
+            queued_actions = {'run_analysis': 'analyze', 'run_pipeline': 'plan',
+                              'run_design': 'background', 'run_background_change': 'background_change',
+                              'run_slides': 'generate', 'run_editable': 'generate'}
+            if settings and function.__name__ in queued_actions:
+                from bot.web.storage import enqueue, Conflict, QuotaExceeded
+                try:
+                    async with db.transaction():
+                        await enqueue(db, session_id, queued_actions[function.__name__], settings.daily_limit)
+                    await arguments['message'].answer('Задание принято. Можно закрыть Telegram — результат придёт в этот чат.')
+                except (Conflict, QuotaExceeded) as error:
+                    from bot.generation import retry_keyboard
+                    await arguments['message'].answer(str(error), reply_markup=retry_keyboard)
+                return
             task = asyncio.current_task()
             existing = self._tasks.get(session_id)
             if existing is not None and existing is not task:

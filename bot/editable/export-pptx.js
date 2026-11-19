@@ -8,6 +8,35 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const emu=n=>Math.round(n*EMU);
 const decode=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 const utf8=s=>new TextEncoder().encode(s);
+function normalizeFonts(){
+ const {fontCoverage:coverage,fontPolicy:policy}=globalThis.POWERGUIDE_EXPORT_CONFIG;
+ if(!coverage)return;
+ const walker=document.createTreeWalker(document.getElementById('presentation-viewport'),NodeFilter.SHOW_TEXT),nodes=[];
+ while(walker.nextNode())nodes.push(walker.currentNode);
+ for(const node of nodes){
+  const el=node.parentElement;if(!node.textContent.trim()||el.closest('style,script,[data-pg-font]'))continue;
+  const c=getComputedStyle(el),candidates=[...c.fontFamily.split(',').map(x=>x.trim().replace(/["']/g,'')),policy.body,'Inter'];
+  const supports=f=>coverage[f]&&[...node.textContent].every(ch=>/\s/.test(ch)||coverage[f].some(([a,b])=>ch.codePointAt(0)>=a&&ch.codePointAt(0)<=b));
+  const font=candidates.find(supports)||'Inter';
+  const span=el instanceof SVGElement?document.createElementNS(el.namespaceURI,'tspan'):document.createElement('span');
+  span.dataset.pgFont=font;span.style.setProperty('font-family',`"${font}"`,'important');
+  span.style.setProperty('font-weight',parseInt(c.fontWeight)>=600?'700':'400','important');
+  node.replaceWith(span);span.append(node);
+ }
+}
+function opacityOf(el){let alpha=1;for(let p=el;p;p=p.parentElement)alpha*=Number(getComputedStyle(p).opacity);return alpha;}
+function applyOpacity(objects,alpha){
+ for(const o of objects){
+  if(o.type==='image')o.alpha=(o.alpha??1)*alpha;
+  for(const c of [o.color,o.stroke?.color,...(o.fill?.stops?o.fill.stops.map(s=>s.color):[o.fill])])if(c)c.alpha=(c.alpha??1)*alpha;
+ }
+ return objects;
+}
+function coverCrop(iw,ih,w,h){
+ const ir=iw/ih,br=w/h,crop={l:0,t:0,r:0,b:0};
+ if(ir>br)crop.l=crop.r=(1-br/ir)/2;else crop.t=crop.b=(1-ir/br)/2;
+ return crop;
+}
 function splitOutside(text,delimiter=',') {
  let depth=0,start=0,parts=[];
  for(let i=0;i<text.length;i++){if(text[i]==='(')depth++;if(text[i]===')')depth--;if(text[i]===delimiter&&!depth){parts.push(text.slice(start,i).trim());start=i+1;}}
@@ -67,14 +96,100 @@ function clipPoints(value,w,h){
 }
 function strokeXML(stroke){
  if(!stroke||!stroke.color)return '<a:ln><a:noFill/></a:ln>';
- return `<a:ln w="${emu(stroke.width||1)}" cap="rnd">${solid(stroke.color)}${stroke.dash?'<a:prstDash val="dash"/>':''}<a:round/></a:ln>`;
+ return `<a:ln w="${emu(stroke.width||1)}" cap="${stroke.cap||'rnd'}">${solid(stroke.color)}${stroke.dash?'<a:prstDash val="dash"/>':''}<a:round/></a:ln>`;
 }
 function transform(o){return `<a:xfrm><a:off x="${emu(o.x)}" y="${emu(o.y)}"/><a:ext cx="${Math.max(1,emu(o.w))}" cy="${Math.max(1,emu(o.h))}"/></a:xfrm>`;}
+// CSS clips descendants at the ancestor's padding edge. Preserve that contour
+// in native OOXML geometry, including captions, without rasterizing the slide.
+function roundedPoints(w,h,radii){
+ const r=radii.map(([x,y])=>[Math.max(0,x),Math.max(0,y)]);
+ const scale=Math.min(1,w/(r[0][0]+r[1][0]||1),w/(r[3][0]+r[2][0]||1),h/(r[0][1]+r[3][1]||1),h/(r[1][1]+r[2][1]||1));
+ r.forEach(a=>{a[0]*=scale;a[1]*=scale;});
+ const centers=[[r[0][0],r[0][1]],[w-r[1][0],r[1][1]],[w-r[2][0],h-r[2][1]],[r[3][0],h-r[3][1]]];
+ const points=[];
+ for(let k=0;k<4;k++){
+  const [rx,ry]=r[k],[cx,cy]=centers[k];
+  if(!rx||!ry){points.push([[0,0],[w,0],[w,h],[0,h]][k]);continue;}
+  const steps=Math.max(6,Math.min(64,Math.ceil(Math.sqrt(Math.max(rx,ry)/.08))));
+  for(let i=0;i<=steps;i++){const a=Math.PI+k*Math.PI/2+i*Math.PI/2/steps;points.push([cx+rx*Math.cos(a),cy+ry*Math.sin(a)]);}
+ }
+ return points;
+}
+function cssRadii(c,w,h){
+ return ['TopLeft','TopRight','BottomRight','BottomLeft'].map(k=>{
+  const v=c[`border${k}Radius`].split(/\s+/);return [measureValue(v[0],w),measureValue(v[1]||v[0],h)];
+ });
+}
+function cssGeometry(c,box){
+ const r=cssRadii(c,box.w,box.h);
+ if(r.every(([x,y])=>!x||!y))return {geometry:'rect'};
+ if(r.every(([x,y])=>x===r[0][0]&&y===r[0][1]&&x===y))return {geometry:'roundRect',radius:Math.min(r[0][0],box.w/2,box.h/2)};
+ if(r.every(([x,y])=>x>=box.w/2&&y>=box.h/2))return {geometry:'ellipse'};
+ return {paths:[{points:roundedPoints(box.w,box.h,r),close:true}]};
+}
+const cross=(a,b,p)=>(b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0]);
+function intersectPolygon(points,clip){
+ // Clipping contours are convex rounded boxes/ellipses (clockwise in CSS).
+ if(clip.reduce((sum,a,i)=>{const b=clip[(i+1)%clip.length];return sum+a[0]*b[1]-b[0]*a[1];},0)<0)clip=[...clip].reverse();
+ let result=points;
+ for(let i=0;i<clip.length&&result.length;i++){
+  const a=clip[i],b=clip[(i+1)%clip.length],next=[];
+  if(Math.hypot(b[0]-a[0],b[1]-a[1])<1e-7)continue;
+  for(let j=0;j<result.length;j++){
+   const p=result[j],q=result[(j+1)%result.length],dp=cross(a,b,p),dq=cross(a,b,q);
+   if(dp>=-1e-7)next.push(p);
+   if((dp>=-1e-7)!==(dq>=-1e-7)){const t=dp/(dp-dq);next.push([p[0]+t*(q[0]-p[0]),p[1]+t*(q[1]-p[1])]);}
+  }
+  result=next;
+ }
+ return result;
+}
+function intersectLine(p,q,clip){
+ if(clip.reduce((sum,a,i)=>{const b=clip[(i+1)%clip.length];return sum+a[0]*b[1]-b[0]*a[1];},0)<0)clip=[...clip].reverse();
+ let lo=0,hi=1;
+ for(let i=0;i<clip.length;i++){
+  const a=clip[i],b=clip[(i+1)%clip.length],d=cross(a,b,p),delta=cross(a,b,q)-d;
+  if(Math.abs(delta)<1e-9){if(d< -1e-7)return null;continue;}
+  if(delta>0)lo=Math.max(lo,-d/delta);else hi=Math.min(hi,-d/delta);
+  if(lo>hi)return null;
+ }
+ return [lo,hi].map(t=>[p[0]+t*(q[0]-p[0]),p[1]+t*(q[1]-p[1])]);
+}
+function overflowContour(el,root){
+ const c=getComputedStyle(el);
+ if(!['hidden','clip','scroll','auto'].includes(c.overflowX)||!['hidden','clip','scroll','auto'].includes(c.overflowY))return null;
+ const b=rect(el,root),inset=['Left','Top','Right','Bottom'].map(s=>parseFloat(c[`border${s}Width`])||0);
+ const [l,t,r,d]=inset,w=Math.max(0,b.w-l-r),h=Math.max(0,b.h-t-d);
+ const radii=cssRadii(c,b.w,b.h).map(([x,y],i)=>[Math.max(0,x-(i===0||i===3?l:r)),Math.max(0,y-(i<2?t:d))]);
+ return roundedPoints(w,h,radii).map(([x,y])=>[x+b.x+l,y+b.y+t]);
+}
+function clipObjects(objects,clips){
+ if(!clips.length)return objects;
+ return objects.flatMap(o=>{
+  // Text stays native and editable; this operation clips painted shapes/images.
+  if(o.type==='text')return [o];
+  const radius=o.geometry==='ellipse'?[[o.w/2,o.h/2]]: [[o.radius||0,o.radius||0]];
+  const source=o.paths||(o.clip?[{points:o.clip,close:true}]:[{points:roundedPoints(o.w,o.h,Array(4).fill(radius[0])),close:true}]);
+  let paths=source.map(p=>({...p,points:p.points.map(([x,y])=>[x+o.x,y+o.y])}));
+  const before=JSON.stringify(paths);
+  for(const clip of clips)paths=paths.flatMap(p=>{
+   if(p.close){const points=intersectPolygon(p.points,clip);return points.length>=3?[{...p,points}]:[];}
+   return p.points.slice(1).flatMap((q,i)=>{const points=intersectLine(p.points[i],q,clip);return points?[{close:false,points}]:[];});
+  });
+  if(!paths.length)return [];
+  if(JSON.stringify(paths)===before)return [o];
+  paths=paths.map(p=>({...p,points:p.points.map(([x,y])=>[x-o.x,y-o.y])}));
+  return [{...o,...(o.type==='image'?{clip:paths[0].points}:{paths})}];
+ });
+}
+function presetGeometry(o){
+ return `<a:prstGeom prst="${o.geometry||'rect'}"><a:avLst>${o.radius&&o.geometry==='roundRect'?`<a:gd name="adj" fmla="val ${Math.round(100000*o.radius/Math.min(o.w,o.h))}"/>`:''}</a:avLst></a:prstGeom>`;
+}
 function customGeometry(paths,w,h){
  return `<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/><a:pathLst>${paths.map(p=>`<a:path w="${Math.max(1,emu(w))}" h="${Math.max(1,emu(h))}"><a:moveTo><a:pt x="${emu(p.points[0][0])}" y="${emu(p.points[0][1])}"/></a:moveTo>${p.points.slice(1).map(([x,y])=>`<a:lnTo><a:pt x="${emu(x)}" y="${emu(y)}"/></a:lnTo>`).join('')}${p.close?'<a:close/>':''}</a:path>`).join('')}</a:pathLst></a:custGeom>`;
 }
 function shapeXML(o,id){
- const geometry=o.paths?customGeometry(o.paths,o.w,o.h):`<a:prstGeom prst="${o.geometry||'rect'}"><a:avLst>${o.radius?`<a:gd name="adj" fmla="val ${Math.round(100000*o.radius/Math.min(o.w,o.h))}"/>`:''}</a:avLst></a:prstGeom>`;
+ const geometry=o.paths?customGeometry(o.paths,o.w,o.h):presetGeometry(o);
  return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${esc(o.name||'Editable shape')}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>${transform(o)}${geometry}${fillXML(o.fill)}${strokeXML(o.stroke)}</p:spPr></p:sp>`;
 }
 function textXML(o,id){
@@ -82,8 +197,8 @@ function textXML(o,id){
 }
 function pictureXML(o,id,rid){
  const crop=o.crop?`<a:srcRect l="${Math.round(o.crop.l*100000)}" t="${Math.round(o.crop.t*100000)}" r="${Math.round(o.crop.r*100000)}" b="${Math.round(o.crop.b*100000)}"/>`:'';
- const geometry=o.clip?customGeometry([{points:o.clip,close:true}],o.w,o.h):`<a:prstGeom prst="${o.geometry||'rect'}"><a:avLst/></a:prstGeom>`;
- return `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${esc(o.name||'Original photo')}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="${rid}">${o.grayscale?'<a:grayscl/>':''}</a:blip>${crop}<a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>${transform(o)}${geometry}</p:spPr></p:pic>`;
+ const geometry=o.clip?customGeometry([{points:o.clip,close:true}],o.w,o.h):o.paths?customGeometry(o.paths,o.w,o.h):presetGeometry(o);
+ return `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${esc(o.name||'Original photo')}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="${rid}">${o.grayscale?'<a:grayscl/>':''}${o.alpha<1?`<a:alphaModFix amt="${Math.round(o.alpha*100000)}"/>`:''}</a:blip>${crop}<a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>${transform(o)}${geometry}</p:spPr></p:pic>`;
 }
 function slideXML(objects,bg,addImage){
  let id=2;
@@ -129,7 +244,10 @@ function rect(el,root){const r=el.getBoundingClientRect();return{x:r.x-root.x,y:
 function svgFill(value){
  if(value&&value.startsWith('url(')){
   const id=value.match(/#([^)'"\s]+)/)?.[1],el=id&&document.getElementById(id);
-  if(el){const stops=Array.from(el.querySelectorAll('stop')).map(s=>{const c=getComputedStyle(s),offset=s.getAttribute('offset')||'0';let rgb=color(c.stopColor);if(rgb)rgb.alpha*=parseFloat(c.stopOpacity||'1');return{position:parseFloat(offset)/(offset.includes('%')?100:1),color:rgb};});if(stops.length)return{stops,angle:135};}
+  if(el){const stops=Array.from(el.querySelectorAll('stop')).map(s=>{const c=getComputedStyle(s),offset=s.getAttribute('offset')||'0';let rgb=color(c.stopColor);if(rgb)rgb.alpha*=parseFloat(c.stopOpacity||'1');return{position:parseFloat(offset)/(offset.includes('%')?100:1),color:rgb};});
+   const coord=(n,d)=>{const s=el.getAttribute(n);return s===null?d:parseFloat(s)/(s.includes('%')?100:1);};
+   const angle=90+Math.atan2(coord('y2',0)-coord('y1',0),coord('x2',1)-coord('x1',0))*180/Math.PI;
+   if(stops.length)return{stops,angle};}
  }
  return color(value);
 }
@@ -141,8 +259,37 @@ function svgObjects(svg,root){
   const matrix=el.getScreenCTM();if(!matrix)continue;
   const map=p=>[matrix.a*p.x+matrix.c*p.y+matrix.e-root.x,matrix.b*p.x+matrix.d*p.y+matrix.f-root.y];
   const box=rect(el,root),stroke={color:color(c.stroke),width:parseFloat(c.strokeWidth)*Math.hypot(matrix.a,matrix.b),dash:c.strokeDasharray!=='none'};
-  if(el.tagName==='circle'||el.tagName==='ellipse'){objects.push({type:'shape',...box,geometry:'ellipse',fill:svgFill(c.fill),stroke,name:'Editable SVG ellipse'});continue;}
-  if(el.tagName==='rect'){objects.push({type:'shape',...box,fill:svgFill(c.fill),stroke,name:'Editable SVG rectangle'});continue;}
+  const fill=svgFill(c.fill),alpha=opacityOf(el);
+  stroke.cap=c.strokeLinecap==='round'?'rnd':c.strokeLinecap==='square'?'sq':'flat';
+  if(stroke.color)stroke.color.alpha*=Number(c.strokeOpacity||1)*alpha;
+  for(const v of fill?.stops?fill.stops.map(s=>s.color):[fill])if(v)v.alpha*=Number(c.fillOpacity||1)*alpha;
+  // A donut made with dasharray is a collection of arcs, not a dashed ellipse.
+  // Materialize its exact painted intervals as editable native paths.
+  if(stroke.color&&stroke.dash&&typeof el.getTotalLength==='function'){
+   const total=el.getTotalLength(),scale=el.hasAttribute('pathLength')?total/Number(el.getAttribute('pathLength')):1;
+   let pattern=c.strokeDasharray.split(/[ ,]+/).map(x=>parseFloat(x)*scale);
+   if(pattern.length%2)pattern=pattern.concat(pattern);
+   const period=pattern.reduce((a,b)=>a+b,0),paths=[];
+   if(period>0){
+    let phase=((parseFloat(c.strokeDashoffset)*scale)%period+period)%period,index=0,t=0,guard=0;
+    while(phase>=pattern[index]){phase-=pattern[index];index=(index+1)%pattern.length;}
+    while(t<total&&guard++<10000){
+     const length=Math.min(pattern[index]-phase,total-t);
+     if(index%2===0&&length>0){
+      const count=Math.min(700,Math.max(2,Math.ceil(length/1.2)));
+      paths.push({close:false,points:Array.from({length:count+1},(_,i)=>{const p=map(el.getPointAtLength(t+length*i/count));return[p[0]-box.x,p[1]-box.y];})});
+     }
+     t+=length;phase=0;index=(index+1)%pattern.length;
+    }
+   }
+   if(paths.length){
+    if(fill&&fill.alpha!==0&&(el.tagName==='circle'||el.tagName==='ellipse'))objects.push({type:'shape',...box,geometry:'ellipse',fill});
+    objects.push({type:'shape',...box,paths,fill:null,stroke:{...stroke,dash:false},name:'Editable SVG dash segments'});
+    continue;
+   }
+  }
+  if(el.tagName==='circle'||el.tagName==='ellipse'){objects.push({type:'shape',...box,geometry:'ellipse',fill,stroke,name:'Editable SVG ellipse'});continue;}
+  if(el.tagName==='rect'){const radius=Math.min(Number(el.getAttribute('rx')||0)*Math.hypot(matrix.a,matrix.b),Math.min(box.w,box.h)/2);objects.push({type:'shape',...box,fill,stroke,radius,geometry:radius?'roundRect':'rect',name:'Editable SVG rectangle'});continue;}
   const total=el.getTotalLength();if(!total)continue;
   const count=Math.min(700,Math.max(2,Math.ceil(total/1.2))),points=[];
   for(let i=0;i<=count;i++)points.push(map(el.getPointAtLength(total*i/count)));
@@ -152,7 +299,7 @@ function svgObjects(svg,root){
   if(current.length>1)paths.push(current);
   if(!paths.length)continue;
   const xs=points.map(p=>p[0]),ys=points.map(p=>p[1]),x=Math.min(...xs),y=Math.min(...ys),w=Math.max(...xs)-x,h=Math.max(...ys)-y;
-  objects.push({type:'shape',x,y,w:Math.max(w,.01),h:Math.max(h,.01),paths:paths.map(ps=>({points:ps.map(([px,py])=>[px-x,py-y]),close:el.tagName==='polygon'||(!stroke.color&&!!svgFill(c.fill))})),fill:svgFill(c.fill),stroke,name:'Editable SVG path'});
+  objects.push({type:'shape',x,y,w:Math.max(w,.01),h:Math.max(h,.01),paths:paths.map(ps=>({points:ps.map(([px,py])=>[px-x,py-y]),close:el.tagName==='polygon'||(!stroke.color&&!!fill)})),fill,stroke,name:'Editable SVG path'});
  }
  for(const text of svg.querySelectorAll('text')){
   const walker=document.createTreeWalker(text,NodeFilter.SHOW_TEXT);let node;
@@ -176,31 +323,56 @@ function textObjects(node,root){
   const font=c.fontFamily.split(',')[0].replace(/["']/g,'');
   objects.push({type:'text',text,x:line.x-root.x,y:line.y-root.y,w:line.right-line.x+5,h:line.h,fontSize:parseFloat(c.fontSize)*fontScale,font:/system|-apple|BlinkMac/i.test(font)?'Arial':font,bold:parseInt(c.fontWeight)>=600,italic:c.fontStyle==='italic',color:svgMatrix?(color(c.fill)||color(c.color)):color(c.color),spacing:parseFloat(c.letterSpacing)||0});
  }
- return objects;
+ return applyOpacity(objects,opacityOf(el));
 }
 function elementBackground(el,root,pseudo){
  const c=getComputedStyle(el,pseudo||null),box=rect(el,root);
  if(pseudo){if(c.content==='none'||c.content==='normal')return [];box.w=parseFloat(c.width)||box.w;box.h=parseFloat(c.height)||box.h;box.x+=parseFloat(c.left)||0;box.y+=parseFloat(c.top)||0;}
- const fill=gradient(c.backgroundImage)||color(c.backgroundColor),border=parseFloat(c.borderTopWidth)||0,objects=[];
+ const fill=gradient(c.backgroundImage)||color(c.backgroundColor),sides=['Top','Right','Bottom','Left'];
+ const uniform=sides.every(s=>c[`border${s}Width`]===c.borderTopWidth&&c[`border${s}Color`]===c.borderTopColor);
+ const border=uniform?(parseFloat(c.borderTopWidth)||0):0,objects=[];
  const clip=clipPoints(c.clipPath,box.w,box.h);
- if(fill||border){const radius=Math.min(measureValue(c.borderRadius.split('/')[0].split(' ')[0],Math.min(box.w,box.h)),Math.min(box.w,box.h)/2);
-  objects.push({type:'shape',...box,fill,geometry:c.borderRadius.includes('%')&&parseFloat(c.borderRadius)>=50?'ellipse':radius?'roundRect':'rect',radius,paths:clip?[{points:clip,close:true}]:null,stroke:border?{color:color(c.borderTopColor),width:border}:null,name:pseudo?'Editable decoration':`Editable ${el.className||el.tagName}`});}
- if(!pseudo){
-  for(const [side,points] of [['Left',[0,0,0,box.h]],['Right',[box.w,0,box.w,box.h]],['Bottom',[0,box.h,box.w,box.h]]]){
+ if(fill||border){
+  objects.push({type:'shape',...box,fill,...cssGeometry(c,box),...(clip?{paths:[{points:clip,close:true}]}:{}),stroke:border?{color:color(c.borderTopColor),width:border}:null,name:pseudo?'Editable decoration':`Editable ${el.className||el.tagName}`});}
+ if(!uniform){
+  for(const [side,points] of [['Top',[0,0,box.w,0]],['Left',[0,0,0,box.h]],['Right',[box.w,0,box.w,box.h]],['Bottom',[0,box.h,box.w,box.h]]]){
    const width=parseFloat(c[`border${side}Width`])||0;if(!width)continue;
    if(width===border&&c[`border${side}Color`]===c.borderTopColor)continue;
    const [x1,y1,x2,y2]=points;
    objects.push({type:'shape',...box,fill:null,paths:[{points:[[x1,y1],[x2,y2]],close:false}],stroke:{color:color(c[`border${side}Color`]),width},name:'Editable accent border'});
   }
  }
- return objects;
+ return applyOpacity(objects,opacityOf(el)*(pseudo?Number(c.opacity):1));
 }
 function visibleBackground(element){
  let current=element;
  while(current){const c=color(getComputedStyle(current).backgroundColor);if(c&&c.alpha>0.99)return c;current=current.parentElement;}
  return {hex:'FFFFFF',alpha:1};
 }
+function measureComposition(slide,root){
+ const candidates=[];
+ for(const el of slide.querySelectorAll('*')){
+  if(el.closest('svg')||['STYLE','SCRIPT','IMG','H1','H2','H3'].includes(el.tagName))continue;
+  const graph=el.closest('[data-infographic]');
+  if(graph&&graph.dataset.infographic===slide.dataset.visualType&&['process','timeline','matrix','before_after','comparison','bar_chart','stack_map','network','table'].includes(slide.dataset.visualType))continue;
+  const c=getComputedStyle(el),b=rect(el,root),text=el.textContent.trim();
+  if(c.display==='none'||c.visibility==='hidden'||opacityOf(el)<.1||text.length<25||b.w<W*.18||b.h<H*.09)continue;
+  const fill=color(c.backgroundColor),paint=(fill&&fill.alpha>=.3)||!!gradient(c.backgroundImage);
+  const border=['Top','Right','Bottom','Left'].filter(s=>parseFloat(c[`border${s}Width`])>0&&color(c[`border${s}Color`])?.alpha>0).length>=3;
+  if(!paint&&!border)continue;
+  // An image frame/caption is not a text card. Connected diagram nodes,
+  // data bars and table cells are excluded through their infographic container.
+  const imageArea=[...el.querySelectorAll('img')].reduce((sum,i)=>{const r=rect(i,root);return sum+r.w*r.h;},0);
+  if(imageArea>b.w*b.h*.25)continue;
+  candidates.push({el,box:b});
+ }
+ const panels=candidates.filter(p=>!candidates.some(q=>q!==p&&q.el.contains(p.el)));
+ return {slide:Number(slide.dataset.slide)||null,visualType:slide.dataset.visualType||null,form:slide.dataset.form||null,
+  panelCount:panels.length,panelAreaRatio:Math.round(Math.min(1,panels.reduce((sum,p)=>sum+p.box.w*p.box.h,0)/(W*H))*1000)/1000,
+  panels:panels.map(p=>Object.fromEntries(Object.entries(p.box).map(([k,v])=>[k,Math.round(v)])))};
+}
 async function collectSlides(){
+ normalizeFonts();
  await document.fonts.ready;
  await Promise.all(Array.from(document.images).map(i=>i.decode().catch(()=>{})));
  const slides=Array.from(document.querySelectorAll('section.slide')),viewport=document.getElementById('presentation-viewport');
@@ -216,34 +388,37 @@ async function collectSlides(){
    const root=slide.getBoundingClientRect(),objects=[];
    const bg=getComputedStyle(slide).backgroundImage;
    const raster=bg.match(/^url\(["']?(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)["']?\)$/);
-   if(raster)objects.push({type:'image',x:0,y:0,w:W,h:H,data:raster[1],name:'Original preset raster background'});
-   function walk(el){
+   if(raster){const img=new Image();img.src=raster[1];await img.decode();objects.push({type:'image',x:0,y:0,w:W,h:H,data:raster[1],crop:coverCrop(img.naturalWidth,img.naturalHeight,W,H),name:'Original preset raster background'});}
+   function walk(el,clips=[]){
     const c=getComputedStyle(el);if(c.display==='none'||c.visibility==='hidden'||c.opacity==='0'||['STYLE','SCRIPT'].includes(el.tagName))return;
-    if(el.tagName.toLowerCase()==='svg'){objects.push(...svgObjects(el,root));return;}
-    objects.push(...elementBackground(el,root));objects.push(...elementBackground(el,root,'::before'));
+    if(el.tagName.toLowerCase()==='svg'){objects.push(...clipObjects(svgObjects(el,root),clips));return;}
+    objects.push(...clipObjects(elementBackground(el,root),clips));
+    const contour=overflowContour(el,root),b=rect(el,root),pathClip=clipPoints(c.clipPath,b.w,b.h);
+    const childClips=[...clips,...(contour?[contour]:[]),...(pathClip?[pathClip.map(([x,y])=>[x+b.x,y+b.y])]:[])];
+    objects.push(...clipObjects(elementBackground(el,root,'::before'),childClips));
     if(el.tagName==='IMG'){
      const box=rect(el,root),ir=el.naturalWidth/el.naturalHeight,br=box.w/box.h;let crop={l:0,t:0,r:0,b:0};
      if(c.objectFit==='cover'){if(ir>br)crop.l=crop.r=(1-br/ir)/2;else crop.t=crop.b=(1-ir/br)/2;}
      if(c.objectFit==='contain'){if(ir>br){const h=box.w/ir;box.y+=(box.h-h)/2;box.h=h;}else{const w=box.h*ir;box.x+=(box.w-w)/2;box.w=w;}}
-     let clip=null;const parent=el.parentElement,pc=getComputedStyle(parent),pb=rect(parent,root);
-     if(Math.abs(pb.w-box.w)<4&&Math.abs(pb.h-box.h)<4)clip=clipPoints(pc.clipPath,box.w,box.h);
-     const radius=measureValue(pc.borderRadius.split('/')[0].split(' ')[0],Math.min(box.w,box.h));
-     const geometry=radius>0?(pc.borderRadius.includes('%')&&parseFloat(pc.borderRadius)>=50?'ellipse':'roundRect'):'rect';
-     objects.push({type:'image',...box,data:el.src,crop,clip,geometry,name:el.alt,grayscale:/grayscale\((1|100%)\)/.test(c.filter)});return;
+     const original=rect(el,root),own=cssGeometry(c,original);
+     const ownClip=clipPoints(c.clipPath,original.w,original.h)||own.paths?.[0].points||roundedPoints(original.w,original.h,cssRadii(c,original.w,original.h));
+     const imageClips=[...clips,ownClip.map(([x,y])=>[x+original.x,y+original.y])];
+     objects.push(...clipObjects([{type:'image',...box,data:el.src,crop,name:el.alt,alpha:opacityOf(el),grayscale:/grayscale\((1|100%)\)/.test(c.filter)}],imageClips));return;
     }
     // Preserve positioned z-index ordering within each container.
     const children=Array.from(el.childNodes).sort((a,b)=>(a.nodeType===1?parseInt(getComputedStyle(a).zIndex)||0:0)-(b.nodeType===1?parseInt(getComputedStyle(b).zIndex)||0:0));
-    for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node);}
+    for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects});
+   results.push({background:visibleBackground(slide),objects,composition:measureComposition(slide,root)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}
 }
 function download(data,name,type){const blob=new Blob([data],{type}),a=document.createElement('a'),url=URL.createObjectURL(blob);a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);}
-globalThis.PowerGuidePptx={buildPptx,collectSlides,zipStore,shapeXML,textXML,pictureXML,clipPoints,color};
+globalThis.PowerGuidePptx={buildPptx,collectSlides,zipStore,shapeXML,textXML,pictureXML,clipPoints,color,coverCrop,roundedPoints,intersectPolygon,clipObjects};
 if(typeof document!=='undefined'){
+ normalizeFonts();
  const button=document.createElement('button');button.textContent='Скачать редактируемый PPTX';button.style.cssText='position:fixed;top:16px;right:20px;z-index:10000;border:0;border-radius:8px;background:#0E5FC4;color:white;padding:14px 22px;font:600 16px Arial;cursor:pointer;box-shadow:0 3px 12px #0002';
  button.id='export-editable-pptx';document.body.appendChild(button);
  const printStyle=document.createElement('style');printStyle.textContent='@media print{#export-editable-pptx{display:none!important}}';document.head.appendChild(printStyle);

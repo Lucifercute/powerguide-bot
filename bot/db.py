@@ -1,4 +1,7 @@
 from pathlib import Path
+from contextlib import asynccontextmanager
+import asyncio
+import fcntl
 
 import aiosqlite
 
@@ -55,15 +58,44 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         self._conn: aiosqlite.Connection | None = None
+        self._transaction = False
 
-    async def connect(self) -> None:
+    async def connect(self, *, migrate: bool = True) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
-        await self._conn.executescript(SCHEMA)
-        await self._migrate()
-        await self._conn.commit()
+        await self._conn.execute("PRAGMA busy_timeout = 10000")
+        if migrate:
+            # API, bot and worker may start together against a fresh database.
+            with self.path.with_suffix('.migration.lock').open('a') as lock:
+                await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)
+                await self._conn.execute("PRAGMA journal_mode = WAL")
+                await self._conn.executescript(SCHEMA)
+                await self._migrate()
+                from bot.web.storage import migrate as migrate_web
+                await migrate_web(self._conn)
+                await self._conn.commit()
+
+    async def commit(self):
+        if not self._transaction:
+            await self.conn.commit()
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Use a dedicated connection per request/job; do not share transactions across tasks."""
+        if self._transaction:
+            raise RuntimeError('Nested transaction')
+        await self.conn.execute('BEGIN IMMEDIATE')
+        self._transaction = True
+        try:
+            yield
+            await self.conn.commit()
+        except BaseException:
+            await self.conn.rollback()
+            raise
+        finally:
+            self._transaction = False
 
     async def _migrate(self) -> None:
         """Bring databases created by older versions up to SCHEMA (CREATE IF NOT EXISTS won't add columns)."""
@@ -97,7 +129,7 @@ class Database:
             (user_id,),
         )
         cur = await self.conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
-        await self.conn.commit()
+        await self.commit()
         return cur.lastrowid
 
     async def finish_session(self, session_id: int, status: str = "completed") -> None:
@@ -105,7 +137,7 @@ class Database:
             "UPDATE sessions SET status = ?, finished_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
             (status, session_id),
         )
-        await self.conn.commit()
+        await self.commit()
 
     async def is_active(self, session_id: int) -> bool:
         async with self.conn.execute("SELECT status FROM sessions WHERE id = ?", (session_id,)) as cur:
@@ -119,7 +151,7 @@ class Database:
 
     async def set_waiting_for(self, session_id: int, value: str | None) -> None:
         await self.conn.execute("UPDATE sessions SET waiting_for = ? WHERE id = ?", (value, session_id))
-        await self.conn.commit()
+        await self.commit()
 
     async def save_answer(self, session_id: int, key: str, question: str, answer: str) -> None:
         await self.conn.execute(
@@ -127,13 +159,13 @@ class Database:
             "VALUES (?, ?, ?, ?)",
             (session_id, key, question, answer),
         )
-        await self.conn.commit()
+        await self.commit()
 
     async def delete_answers(self, session_id: int, keys: list[str]) -> None:
         await self.conn.executemany(
             "DELETE FROM answers WHERE session_id = ? AND question_key = ?", [(session_id, k) for k in keys]
         )
-        await self.conn.commit()
+        await self.commit()
 
     async def get_answers(self, session_id: int) -> dict[str, str]:
         async with self.conn.execute(
@@ -147,7 +179,7 @@ class Database:
             "INSERT OR REPLACE INTO artifacts (session_id, kind, content, model) VALUES (?, ?, ?, ?)",
             (session_id, kind, content, model),
         )
-        await self.conn.commit()
+        await self.commit()
 
     async def get_artifacts(self, session_id: int) -> dict[str, str]:
         async with self.conn.execute(
@@ -158,7 +190,7 @@ class Database:
 
     async def delete_artifact(self, session_id: int, kind: str) -> None:
         await self.conn.execute("DELETE FROM artifacts WHERE session_id = ? AND kind = ?", (session_id, kind))
-        await self.conn.commit()
+        await self.commit()
 
     async def add_source_file(self, session_id: int, file: SourceFile) -> None:
         await self.conn.execute(
@@ -166,7 +198,7 @@ class Database:
             "VALUES (?, (SELECT COUNT(*) + 1 FROM source_files WHERE session_id = ?), ?, ?, ?, ?)",
             (session_id, session_id, file.name, str(file.path), file.mime_type, file.text),
         )
-        await self.conn.commit()
+        await self.commit()
 
     async def get_source_files(self, session_id: int) -> list[SourceFile]:
         async with self.conn.execute(
@@ -178,7 +210,7 @@ class Database:
 
     async def delete_source_files(self, session_id: int) -> None:
         await self.conn.execute("DELETE FROM source_files WHERE session_id = ?", (session_id,))
-        await self.conn.commit()
+        await self.commit()
 
     async def get_artifact(self, session_id: int, kind: str) -> str | None:
         async with self.conn.execute(

@@ -11,13 +11,14 @@ from PIL import Image as PILImage
 
 from bot.pipeline import PLAN, TZ, DATA, STYLE, STYLE_PRESET, MAX_SLIDES
 from bot.plan import plan_slides
+from bot.presets import PresetStore
 from bot.runtime import chosen_background, load_user_images, session_ratio
 from . import prompts
 from .browser import chrome_path, render
-from .html import package, validate_deck, validate_plan
+from .html import package, validate_deck, validate_plan, normalize_deck, deck_contract
 from .models import Deck, VisualPlan
 
-EXPORT_VERSION = 2
+EXPORT_VERSION = 9
 
 def sha(data):
     return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
@@ -45,15 +46,18 @@ def image_data(path):
 
 
 class EditableService:
-    def __init__(self, llm, images, prompts_dir=Path('prompts'), *, prompt_set=None):
+    def __init__(self, llm, images, prompts_dir=Path('prompts'), *, prompt_set=None, presets_dir=Path('presets')):
         self.llm, self.images = llm, images
         self.prompts_dir = Path(prompts_dir)
         self.prompt_set = prompt_set
+        self.presets = PresetStore(Path(presets_dir))
 
-    async def _json_stage(self, folder, name, prompt, schema, validate, background):
+    async def _json_stage(self, folder, name, prompt, schema, validate, background, *, normalize=None):
         final = folder / f'{name}.json'
         if final.exists():
             value = schema.model_validate_json(final.read_text())
+            if normalize:
+                value = normalize(value)
             validate(value)
             return value
         feedback = ''
@@ -81,6 +85,8 @@ class EditableService:
             saved = json.loads(raw.read_text())
             try:
                 value = schema.model_validate_json(saved['text'])
+                if normalize:
+                    value = normalize(value)
                 validate(value)
             except ValueError as error:
                 feedback = ('\nИсправь предыдущий ответ. Ошибка проверки: ' + str(error)[:3000]
@@ -92,11 +98,16 @@ class EditableService:
         raise ValueError(f'Не удалось проверить этап {name}; сохранены запросы и ответы')
 
     async def generate(self, db, session_id, files_dir, status):
-        instructions = self.prompt_set or prompts.load(self.prompts_dir)
         # Check the local dependency before spending API quota.
         chrome_path()
         folder = files_dir / str(session_id) / 'editable'
         folder.mkdir(parents=True, exist_ok=True)
+        saved_prompts = folder / 'prompt-set.json'
+        if saved_prompts.exists():
+            instructions = prompts.PromptSet(**json.loads(saved_prompts.read_text()))
+        else:
+            instructions = self.prompt_set or prompts.load(self.prompts_dir)
+            write(saved_prompts, vars(instructions))
         artifacts = await db.get_artifacts(session_id)
         approved = artifacts[PLAN.kind]
         numbers = list(plan_slides(approved))
@@ -119,10 +130,20 @@ class EditableService:
         fingerprint = sha(json.dumps(context, ensure_ascii=False) + sha(background[0]))
         request = folder / 'input.json'
         if request.exists():
-            if json.loads(request.read_text())['fingerprint'] != fingerprint:
+            saved = json.loads(request.read_text())
+            if saved.get('source_fingerprint', saved['fingerprint']) != fingerprint:
                 raise ValueError('Исходные материалы изменились после начала генерации')
+            # Resume with the passport/font policy used by the initial request,
+            # even if the preset files have since been updated.
+            context = saved['context']
         else:
-            write(request, {'fingerprint': fingerprint, 'context': context, 'background_sha256': sha(background[0])})
+            source_fingerprint = fingerprint
+            preset_number = context.get('style_preset')
+            if preset_number and str(preset_number).isdigit():
+                context.update(self.presets.html_options(int(preset_number)))
+            fingerprint = sha(json.dumps(context, ensure_ascii=False) + sha(background[0]))
+            write(request, {'fingerprint': fingerprint, 'source_fingerprint': source_fingerprint,
+                            'context': context, 'background_sha256': sha(background[0])})
         bgfile = folder / ('background.png' if background[1] == 'image/png' else 'background.jpg')
         if not bgfile.exists():
             bgfile.write_bytes(background[0])
@@ -141,16 +162,20 @@ class EditableService:
                                      VisualPlan, lambda p: validate_plan(p, len(numbers)), background)
         await status('Создаю оформление и инфографику…')
         prompt = instructions.HTML + '\nINPUT\n' + json.dumps(context, ensure_ascii=False) + '\nVISUAL_PLAN\n' + plan.model_dump_json()
-        deck = await self._json_stage(folder, 'deck', prompt, Deck, lambda d: validate_deck(d, plan, pictures), background)
+        prompt += deck_contract(plan, pictures)
+        deck = await self._json_stage(folder, 'deck', prompt, Deck, lambda d: validate_deck(d, plan, pictures), background,
+                                      normalize=lambda d: normalize_deck(d, plan))
         for layout_attempt in range(2):
             if layout_attempt:
-                deck = await self._json_stage(folder, 'layout-repair', prompt + '\nИсправь выход текста за границы. '
+                deck = await self._json_stage(folder, 'layout-repair', prompt + '\nИсправь перечисленные ошибки вёрстки и композиции. '
                     'Сохрани все изображения и их id/prompts, содержание и инфографику.\n'
                     + (folder / 'layout-error.txt').read_text() + '\nPREVIOUS_DECK\n' + deck.model_dump_json(),
-                    Deck, lambda d: validate_deck(d, plan, pictures), background)
+                    Deck, lambda d: validate_deck(d, plan, pictures), background,
+                    normalize=lambda d: normalize_deck(d, plan))
             assets = {}
             for i, spec in enumerate(deck.images, 1):
-                image_prompt = instructions.IMAGE + spec.prompt
+                image_prompt = (instructions.IMAGE + '\nSTYLE_PASSPORT\n' + context.get('style_description', '')
+                                + '\nILLUSTRATION\n' + spec.prompt)
                 image_hash = sha(image_prompt + spec.aspect_ratio + sha(background[0]))
                 meta_path = folder / f'image-{spec.id}.json'
                 meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -169,7 +194,8 @@ class EditableService:
                 temp.replace(path)
                 assets[spec.id] = image_data(path)
                 write(meta_path, {'file': path.name, 'fingerprint': image_hash, 'model': model, 'prompt': image_prompt})
-            write(final_html, await asyncio.to_thread(package, deck, plan, assets, user_assets, background, width, height, session_id))
+            write(final_html, await asyncio.to_thread(package, deck, plan, assets, user_assets, background,
+                                                     width, height, session_id, context.get('font_policy')))
             await status('Собираю PowerPoint и проверяю расположение текста…')
             try:
                 await render(final_html, final_pptx, len(numbers), width, height)
@@ -177,7 +203,7 @@ class EditableService:
                 write(folder / 'layout-error.txt', str(error))
                 if layout_attempt:
                     raise
-                await status('Уточняю вёрстку, чтобы текст поместился на слайдах…')
+                await status('Уточняю вёрстку и композицию слайдов…')
                 continue
             break
         write(completed, {'html_sha256': sha(final_html.read_bytes()), 'pptx_sha256': sha(final_pptx.read_bytes()),

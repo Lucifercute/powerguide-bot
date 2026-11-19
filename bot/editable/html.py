@@ -10,10 +10,46 @@ from lxml import html
 from pptx import Presentation
 from pptx.util import Inches
 
-from .models import Deck, VisualPlan
+from .models import Deck, VisualPlan, FORM_TYPES
+from .fonts import embed_fonts, font_bundle
 
 GRAPHS = {'process', 'timeline', 'matrix', 'before_after', 'comparison',
           'bar_chart', 'stack_map', 'network', 'table'}
+
+
+def normalize_deck(deck: Deck, plan: VisualPlan) -> Deck:
+    """Canonicalize a known form used as a type; preserve content and raw responses."""
+    doc = html.document_fromstring(deck.html)
+    changed = False
+    for spec in plan.slides:
+        if not spec.form or FORM_TYPES.get(spec.form) != spec.visual_type or spec.form == spec.visual_type:
+            continue
+        for section in doc.xpath('//section[@data-slide=$n]', n=str(spec.number)):
+            # Only the exact approved form is an alias. A different design is
+            # still rejected by validation rather than relabelled as compliant.
+            if section.get('data-visual-type') == spec.form:
+                section.set('data-visual-type', spec.visual_type)
+                changed = True
+            for graph in section.xpath('.//*[@data-infographic=$form]', form=spec.form):
+                graph.set('data-infographic', spec.visual_type)
+                changed = True
+    if not changed:
+        return deck
+    return deck.model_copy(update={'html': '<!DOCTYPE html>\n' + html.tostring(doc, encoding='unicode', method='html')})
+
+
+def deck_contract(plan: VisualPlan, user_slides=()) -> str:
+    """Explicit per-slide invariants, also appended when resuming older prompts."""
+    rows = [{'data-slide': str(s.number), 'data-visual-type': s.visual_type,
+             'data-form': s.form, 'required_user_image': (
+                 f'<img data-user-slide="{s.number}" ...>' if s.number in user_slides else None)}
+            for s in plan.slides]
+    return ('\nHTML_CONTRACT\nТип visual_type и форма form — разные поля. '
+            'В data-visual-type и data-infographic используй visual_type, НЕ код формы. '
+            'Для каждой required_user_image нужен ровно один img на указанном слайде, '
+            'без src, с заданными размерами и object-fit:contain. '
+            'Сохраняй все эти требования при исправлении любой ошибки.\n'
+            + json.dumps(rows, ensure_ascii=False))
 
 
 def validate_plan(plan: VisualPlan, count: int) -> None:
@@ -58,6 +94,7 @@ def validate_deck(deck: Deck, plan: VisualPlan, user_slides=()):
     if re.search(r'@import|url\s*\(', css, re.I):
         raise ValueError('Внешние изображения/шрифты в CSS не разрешены')
     ids = set()
+    errors = []
     for image in deck.images:
         if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9-]{0,63}', image.id) or image.id in ids:
             raise ValueError('Неверный id иллюстрации')
@@ -68,32 +105,40 @@ def validate_deck(deck: Deck, plan: VisualPlan, user_slides=()):
             raise ValueError('Отсутствует место для иллюстрации')
     for number in user_slides:
         if len(sections[number - 1].xpath('.//img[@data-user-slide=$n]', n=str(number))) != 1:
-            raise ValueError('Пропущена фотография пользователя')
+            errors.append(f'Слайд {number}: нужен ровно один <img data-user-slide="{number}"> '
+                          'для фотографии пользователя, без src, с размерами и object-fit:contain.')
     images = doc.xpath('//img')
     if len(images) != len(ids) + len(user_slides):
-        raise ValueError('Лишние или повторяющиеся изображения')
+        errors.append(f'Неверное число img: {len(images)}; ожидается {len(ids) + len(user_slides)} '
+                      '(иллюстрации и все фотографии пользователя).')
     for el in images:
         if el.get('data-asset-id') not in ids and el.get('data-user-slide') not in {str(n) for n in user_slides}:
             raise ValueError('Неизвестное изображение')
     for spec, section in zip(plan.slides, sections):
         if section.get('data-visual-type') != spec.visual_type:
-            raise ValueError('Тип визуализации не соответствует плану')
+            errors.append(f'Слайд {spec.number}: data-visual-type="{section.get("data-visual-type")}"; '
+                          f'требуется data-visual-type="{spec.visual_type}". '
+                          f'Код формы {spec.form!r} — отдельное поле data-form.')
         if spec.visual_type not in GRAPHS:
             continue
         graphs = section.xpath('.//*[@data-infographic=$kind]', kind=spec.visual_type)
         if len(graphs) != 1:
-            raise ValueError(f'Нет инфографики на слайде {spec.number}')
+            errors.append(f'Слайд {spec.number}: нужен один контейнер data-infographic="{spec.visual_type}".')
+            continue
         g = graphs[0]
         if spec.visual_type in {'process', 'network', 'timeline', 'stack_map'}:
             if len(g.xpath('.//*[@data-node]')) < 2:
-                raise ValueError('У схемы нет узлов')
+                errors.append(f'Слайд {spec.number}: у схемы нужны минимум два элемента data-node.')
             if spec.visual_type != 'stack_map' and not g.xpath('.//*[@data-connector]|.//*[local-name()="line" or local-name()="path" or local-name()="polyline"]'):
-                raise ValueError('У схемы нет соединений')
+                errors.append(f'Слайд {spec.number}: у схемы нужны соединения data-connector или SVG line/path/polyline.')
         elif spec.visual_type in {'bar_chart', 'comparison', 'before_after'}:
             if len(g.xpath('.//*[@data-bar]')) < 2:
-                raise ValueError('Нет геометрии диаграммы')
+                errors.append(f'Слайд {spec.number} ({spec.visual_type}): внутри data-infographic нужны '
+                              'минимум два элемента data-bar, обозначающие величины (столбцы, секторы, точки).')
         elif len(g.xpath('.//tr')) < 2 and len(g.xpath('.//*[@data-cell]')) < 4:
-            raise ValueError('Нет строк и столбцов таблицы')
+            errors.append(f'Слайд {spec.number}: нужны строки таблицы или минимум четыре элемента data-cell.')
+    if errors:
+        raise ValueError('\n'.join(errors))
     return doc
 
 
@@ -101,7 +146,7 @@ def uri(data: bytes, mime: str) -> str:
     return f'data:{mime};base64,' + base64.b64encode(data).decode()
 
 
-def template(count, width, height):
+def template(count, width, height, faces=()):
     p = Presentation()
     p.slide_width, p.slide_height = Inches(width / 120), Inches(height / 120)
     for _ in range(count):
@@ -109,11 +154,18 @@ def template(count, width, height):
     out = io.BytesIO()
     p.save(out)
     with ZipFile(out) as z:
-        return {n: base64.b64encode(z.read(n)).decode() for n in z.namelist()}
+        files = {n: z.read(n) for n in z.namelist()}
+    if faces:
+        embed_fonts(files, faces)
+    return {n: base64.b64encode(data).decode() for n, data in files.items()}
 
 
-def package(deck, plan, assets, user_images, background, width, height, session_id):
+def package(deck, plan, assets, user_images, background, width, height, session_id, font_policy=None):
     doc = validate_deck(deck, plan, user_images)
+    fonts = font_bundle(font_policy)
+    for spec in plan.slides:
+        if spec.form:
+            doc.xpath('//section[@data-slide=$number]', number=str(spec.number))[0].set('data-form', spec.form)
     for spec in deck.images:
         el = doc.xpath('//img[@data-asset-id=$id]', id=spec.id)[0]
         el.set('src', uri(*assets[spec.id]))
@@ -123,16 +175,15 @@ def package(deck, plan, assets, user_images, background, width, height, session_
     head, body = doc.find('head'), doc.find('body')
     policy = html.Element('meta', attrib={'http-equiv': 'Content-Security-Policy', 'content':
         "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-        "connect-src 'none'; font-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"})
+        "connect-src 'none'; font-src data:; frame-src 'none'; base-uri 'none'; form-action 'none'"})
     head.insert(0, policy)
     style = html.Element('style')
     style.text = f'''
     :root{{--exact-preset-background:url("{uri(*background)}");}}
     html,body{{margin:0;overflow:hidden;background:#222;}}
     #presentation-viewport{{width:{width}px!important;height:{height}px!important;background:transparent!important;}}
-    #presentation-viewport,#presentation-viewport *{{font-family:Arial,sans-serif!important;}}
     section.slide{{box-sizing:border-box;width:{width}px!important;height:{height}px!important;
-      background-image:var(--exact-preset-background)!important;background-size:100% 100%!important;
+      background-image:var(--exact-preset-background)!important;background-size:cover!important;background-position:center!important;
       background-repeat:no-repeat!important;background-color:transparent!important;}}
     #pg-nav{{position:fixed;bottom:12px;right:20px;z-index:9999;background:#172536;color:white;padding:10px;font:16px Arial;}}
     #pg-nav button{{padding:8px 16px;margin:0 8px;cursor:pointer;}}
@@ -141,15 +192,17 @@ def package(deck, plan, assets, user_images, background, width, height, session_
       #presentation-viewport{{transform:none!important;position:static!important;height:auto!important;}}
       section.slide{{display:block!important;position:relative!important;break-after:page;}}}}
     '''
+    style.text += fonts['css']
     head.append(style)
     nav = html.Element('div', id='pg-nav')
     nav.text = ''
     body.append(nav)
     config = {'sessionId': session_id, 'slideCount': len(plan.slides), 'width': width, 'height': height,
-              'fileName': f'presentation-{session_id}-editable.pptx'}
+              'fileName': f'presentation-{session_id}-editable.pptx',
+              'fontPolicy': fonts['policy'], 'fontCoverage': fonts['coverage']}
     script = html.Element('script')
     script.text = ('globalThis.POWERGUIDE_EXPORT_CONFIG=' + json.dumps(config) + ';\n'
-                   'globalThis.POWERGUIDE_PPTX_TEMPLATE=' + json.dumps(template(len(plan.slides), width, height)) + ';\n')
+                   'globalThis.POWERGUIDE_PPTX_TEMPLATE=' + json.dumps(template(len(plan.slides), width, height, fonts['faces'])) + ';\n')
     script.text += '''(()=>{const {width:w,height:h}=POWERGUIDE_EXPORT_CONFIG;
       const v=document.getElementById('presentation-viewport'),s=[...v.querySelectorAll('section.slide')];
       const displays=s.map(x=>getComputedStyle(x).display==='none'?'block':getComputedStyle(x).display);

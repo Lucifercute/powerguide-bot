@@ -1,0 +1,224 @@
+[
+  {
+    "family": "montserrat",
+    "file": "montserrat/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/METADATA.pb",
+    "sha256": "c48dbcaee013b8f6a33e7e6a79191adbf098a36839367d9750598594ff664e5f"
+  },
+  {
+    "family": "montserrat",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+    "sha256": "0f7b311b2f3279e4eef9b2f968bcdbab6e28f4daeb1f049f4f278a902bcd82f7"
+  },
+  {
+    "family": "montserrat",
+    "file": "montserrat/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/OFL.txt",
+    "sha256": "8b7141c03fa4f8d44e6345d5d4931709290f0f67875e452e95ac1fd3a027802e"
+  },
+  {
+    "family": "roboto",
+    "file": "roboto/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/METADATA.pb",
+    "sha256": "6fef19da54fb62d152f0c7b21710e6849950db7ecf852ea29511c593dad462f0"
+  },
+  {
+    "family": "roboto",
+    "file": "roboto/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/OFL.txt",
+    "sha256": "061402327a96aadb0bfb694a960ed289ecd38d383e396243831ab81feb109c41"
+  },
+  {
+    "family": "roboto",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto%5Bwdth%2Cwght%5D.ttf",
+    "sha256": "d7598e12c5dbef095ff8272cfc55da0250bd07fbdecbac8a530b9b277872a134"
+  },
+  {
+    "family": "exo2",
+    "file": "exo2/Exo2[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/exo2/Exo2%5Bwght%5D.ttf",
+    "sha256": "205a448676a2586f9c57c25f3d5c58ca8db7e6cf5edf7506783a010c6fe2bfb5"
+  },
+  {
+    "family": "exo2",
+    "file": "exo2/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/exo2/METADATA.pb",
+    "sha256": "465b6e658106342dab756a190234bb03d1d7d3bdcb21e68b6d74f9807a781b43"
+  },
+  {
+    "family": "exo2",
+    "file": "exo2/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/exo2/OFL.txt",
+    "sha256": "7f95a8eeecc6904ffc81cd10cc8ebc7fcee72a67922924bf45f02dff03b88127"
+  },
+  {
+    "family": "poppins",
+    "file": "poppins/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/METADATA.pb",
+    "sha256": "8121646e47a90cbcd2f4664e0df036944880035522b4f25ec51cb9465428b346"
+  },
+  {
+    "family": "poppins",
+    "file": "poppins/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/OFL.txt",
+    "sha256": "6be04893d770899a015649c7aa3b582f871b272f8747a92b78b17c3e5c8b2573"
+  },
+  {
+    "family": "poppins",
+    "file": "poppins/Poppins-Bold.ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf",
+    "sha256": "983676516167748b74de6f4771fb384c664fd913acb8b471122ecacf5da5ea6c"
+  },
+  {
+    "family": "poppins",
+    "file": "poppins/Poppins-Regular.ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf",
+    "sha256": "7e65201e9b79159e2300267cc885e16c8dcef2424cdfa09a29bfb0980a94a7ba"
+  },
+  {
+    "family": "opensans",
+    "file": "opensans/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/METADATA.pb",
+    "sha256": "50305d75a1b32bc4b5f59a037a71b0db45be509479519f7fded5b9cfa86217e8"
+  },
+  {
+    "family": "opensans",
+    "file": "opensans/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OFL.txt",
+    "sha256": "fbbbcfef55318de350562559b671360de6d597112ecc5c73881b05092db89602"
+  },
+  {
+    "family": "opensans",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OpenSans%5Bwdth%2Cwght%5D.ttf",
+    "sha256": "36643644f318a812aab2d2ed3bb98f8cf0872527f835fe9398d95fe6b9adb878"
+  },
+  {
+    "family": "inter",
+    "file": "inter/Inter[opsz,wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf",
+    "sha256": "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031"
+  },
+  {
+    "family": "inter",
+    "file": "inter/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/METADATA.pb",
+    "sha256": "79e4721ef4f72251c6080a40dfd9efb6728b4df1fc690f0c70eb4b1b5303a5b0"
+  },
+  {
+    "family": "inter",
+    "file": "inter/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/OFL.txt",
+    "sha256": "5b9321a4298cfeb6b34354164a1c3afc3db114569984c502b9b35d988fd58c57"
+  },
+  {
+    "family": "plusjakartasans",
+    "file": "plusjakartasans/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/plusjakartasans/METADATA.pb",
+    "sha256": "e7953d66e52a1e09235d75fc7aef7139c2733c0b5507afcf6e9afbe0fcef1de6"
+  },
+  {
+    "family": "plusjakartasans",
+    "file": "plusjakartasans/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/plusjakartasans/OFL.txt",
+    "sha256": "995c7199cab65954f545996326755daee7b63cc6b42b06c13da1f9502ab08a99"
+  },
+  {
+    "family": "plusjakartasans",
+    "file": "plusjakartasans/PlusJakartaSans[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/plusjakartasans/PlusJakartaSans%5Bwght%5D.ttf",
+    "sha256": "89b3fb38aa0d275d7a731d0d817a4f1622b316b4d7fbdedcf02ee9099ff68bc8"
+  },
+  {
+    "family": "rubik",
+    "file": "rubik/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/rubik/METADATA.pb",
+    "sha256": "2e81cc9a038e89bcf9a14cd4e2d4513c1b5959e8b9189b835d4ecf4af11968a6"
+  },
+  {
+    "family": "rubik",
+    "file": "rubik/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/rubik/OFL.txt",
+    "sha256": "472cbe7c25441df63e9c7864b43eb3c0f4b3df950c66a76224e6cfe1eae843fb"
+  },
+  {
+    "family": "rubik",
+    "file": "rubik/Rubik[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/rubik/Rubik%5Bwght%5D.ttf",
+    "sha256": "1b3a7437ba2af80e465e773ed60c5036d1ba6ace492d89046dbcf18fb31e4e88"
+  },
+  {
+    "family": "oswald",
+    "file": "oswald/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/METADATA.pb",
+    "sha256": "3d5119d2e99a15e7c2973937d10a77e7aa1fc6a28fe173b02e059485aa596097"
+  },
+  {
+    "family": "oswald",
+    "file": "oswald/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/OFL.txt",
+    "sha256": "0fd731a904b729a4e02eaf5e8ebd06783edd9abe400e8882760160230675b652"
+  },
+  {
+    "family": "oswald",
+    "file": "oswald/Oswald[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/Oswald%5Bwght%5D.ttf",
+    "sha256": "5b38c246e255a12f5712d640d56bcced0472466fc68983d2d0410ec0457c2817"
+  },
+  {
+    "family": "manrope",
+    "file": "manrope/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/manrope/METADATA.pb",
+    "sha256": "fb204147a7c16d009d4fa53248b6075bc941d7adfa450a825bc5d4cef2f9ded9"
+  },
+  {
+    "family": "manrope",
+    "file": "manrope/Manrope[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/manrope/Manrope%5Bwght%5D.ttf",
+    "sha256": "3ae11c49db0455a3cc33e37d380f20fdb8c7f8b41dc07625c177e3d87a9d6ae6"
+  },
+  {
+    "family": "manrope",
+    "file": "manrope/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/manrope/OFL.txt",
+    "sha256": "58172e0c0fac2cda8a37b348164bb55e44b0e69051e557e92b1d3f6910141f7b"
+  },
+  {
+    "family": "nunitosans",
+    "file": "nunitosans/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/nunitosans/METADATA.pb",
+    "sha256": "b60c93a2cdadb477316d22d22c8d43fa957899a4e4fe75cbb2b9e39e03c5e96e"
+  },
+  {
+    "family": "nunitosans",
+    "file": "nunitosans/NunitoSans[YTLC,opsz,wdth,wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/nunitosans/NunitoSans%5BYTLC%2Copsz%2Cwdth%2Cwght%5D.ttf",
+    "sha256": "f934d7142fb4784bf828da485b7dcbd90c0c80d514e9d49a5da0ed3a1ae2491d"
+  },
+  {
+    "family": "nunitosans",
+    "file": "nunitosans/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/nunitosans/OFL.txt",
+    "sha256": "efbb0c9e864cef973982d9a17567e6be5c3d1759695574586f3f18c7ecca064b"
+  },
+  {
+    "family": "robotomono",
+    "file": "robotomono/METADATA.pb",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/robotomono/METADATA.pb",
+    "sha256": "8aa7709a44aa1f10bc5f4710af9440e364d2fb4e6056cc05a0e9d0d40826a9b5"
+  },
+  {
+    "family": "robotomono",
+    "file": "robotomono/OFL.txt",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/robotomono/OFL.txt",
+    "sha256": "50ab8dd54680d3473f649c9db86fece88434d097c7834475c1c72d2f8c429215"
+  },
+  {
+    "family": "robotomono",
+    "file": "robotomono/RobotoMono[wght].ttf",
+    "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/robotomono/RobotoMono%5Bwght%5D.ttf",
+    "sha256": "66a80e79d17e4c7cabd162e2916578a4cc08fd19eef6e2a643305eae9c567b2b"
+  }
+]

@@ -21,6 +21,7 @@ from aiogram.types import (
 )
 
 from bot.db import Database
+from bot import presentation
 from bot.llm import Image, LLMError
 from bot.pipeline import (
     ASKED_QUESTIONS,
@@ -411,9 +412,7 @@ async def run_analysis(
     artifacts = await db.get_artifacts(session_id)
     sources = await db.get_source_files(session_id)
     try:
-        found, model = await pipeline.analyze_survey(
-            survey, artifacts.get(DESCRIPTION, ""), artifacts.get(SOURCES_NOTE), sources
-        )
+        found, model = await presentation.analyze_survey(db, bank, pipeline, session_id)
     except LLMError as e:
         log.error("Survey analysis failed for session %d: %s", session_id, e)
         await message.answer(ANALYSIS_FAILED, reply_markup=retry_keyboard)
@@ -546,38 +545,7 @@ async def run_pipeline(
     Intermediate results are not shown to the user. They are saved after each step,
     so after a failure the retry continues from the failed step instead of starting over.
     """
-    survey = bank.load()
-    answers = await db.get_answers(session_id)
-    for number, step in enumerate(STEPS, start=1):
-        if await db.get_artifact(session_id, step.kind) is not None:
-            continue
-        await message.answer(f"Шаг {number} из {len(STEPS)}: {step.title.lower()}. Это может занять минуту…")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-        if step is DATA and await db.get_artifact(session_id, SOURCES) is None:
-            if search_declined(answers.get(RESEARCH_ANSWER_KEY)):
-                # Empty sources: step 02 is told there is no internet access.
-                log.info("Web search skipped for session %d: the user said it is not needed", session_id)
-                await db.save_artifact(session_id, SOURCES, "")
-            else:
-                await message.answer("Ищу информацию в открытых источниках…")
-                tz = await db.get_artifact(session_id, TZ.kind)
-                await db.save_artifact(session_id, SOURCES, await pipeline.find_sources(tz))
-
-        artifacts = await db.get_artifacts(session_id)
-        try:
-            sources = await db.get_source_files(session_id)
-            result, model = await pipeline.run_step(step, survey, answers, artifacts, sources)
-        except LLMError as e:
-            log.error("Step %s failed for session %d: %s", step.kind, session_id, e)
-            if e.quota_exceeded:
-                text = "Лимит бесплатных запросов к нейросети исчерпан. Прогресс сохранён — попробуйте позже."
-            else:
-                text = "Нейросеть сейчас не отвечает. Прогресс сохранён — попробуйте ещё раз."
-            await message.answer(text, reply_markup=retry_keyboard)
-            return
-
-        await db.save_artifact(session_id, step.kind, result, model)
+    await presentation.prepare_plan(db, bank, pipeline, session_id, message.answer)
 
     await show_plan(message, db, session_id)
 
@@ -773,31 +741,10 @@ async def receive_style_ref(
 async def run_design(message: Message, db: Database, pipeline: Pipeline, files_dir: Path, session_id: int) -> None:
     """Generate the first background (prompt 04) and show it with «Принять» / «Доработать» /
     «Нарисовать заново». The prompt fields are filled from the ТЗ once and reused on retry."""
-    artifacts = await db.get_artifacts(session_id)
-    reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
-    await message.answer("Рисую фон для слайдов. Это может занять до минуты…")
-    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    try:
-        if BACKGROUND_FIELDS in artifacts:
-            fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
-        else:
-            fields = await pipeline.background_fields(artifacts[TZ.kind], has_reference=reference is not None)
-            await db.save_artifact(session_id, BACKGROUND_FIELDS, fields.model_dump_json())
-        image, model = await pipeline.background(fields, await session_ratio(db, session_id), reference)
-    except LLMError as e:
-        log.error("Background failed for session %d: %s", session_id, e)
-        await message.answer(
-            "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз.",
-            reply_markup=retry_keyboard,
-        )
-        return
-    path = save_image(files_dir, session_id, "Фон", image)
-    await db.save_artifact(session_id, BACKGROUND, str(path), model)
-    await message.answer_photo(
-        BufferedInputFile(image.data, filename=path.name),
-        caption=BACKGROUND_CAPTION,
-        reply_markup=background_keyboard,
-    )
+    await message.answer("Рисую фон для слайдов…")
+    image, path = await presentation.draw_background(db, pipeline, files_dir, session_id)
+    await message.answer_photo(BufferedInputFile(image.data, filename=path.name),
+                               caption=BACKGROUND_CAPTION, reply_markup=background_keyboard)
 
 
 def background_stage(artifacts: dict[str, str], waiting_for: str | None) -> str | None:
@@ -826,37 +773,9 @@ async def run_background_change(
     the style stays the reference's, and only the composition and elements change.
     """
     artifacts = await db.get_artifacts(session_id)
-    attempt = artifacts[BACKGROUND_ATTEMPT]
-    ratio = await session_ratio(db, session_id)
-    first = load_image(artifacts[BACKGROUND])
-    if attempt == ATTEMPT_EDIT:
-        await message.answer("Дорабатываю фон. Это может занять до минуты…")
-    else:
-        await message.answer("Рисую новый фон. Это может занять до минуты…")
-    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    try:
-        if attempt == ATTEMPT_EDIT:
-            image, model = await pipeline.edit_background(first, artifacts[BACKGROUND_COMMENT], ratio)
-        else:
-            reference = load_image(artifacts[STYLE_REF]) if artifacts.get(STYLE_REF) else None
-            fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_FIELDS])
-            if reference is None:
-                if BACKGROUND_ALT_FIELDS in artifacts:
-                    fields = BackgroundFields.model_validate_json(artifacts[BACKGROUND_ALT_FIELDS])
-                else:
-                    fields = await pipeline.background_fields(artifacts[TZ.kind], False, previous=fields)
-                    await db.save_artifact(session_id, BACKGROUND_ALT_FIELDS, fields.model_dump_json())
-            image, model = await pipeline.background(fields, ratio, reference, previous=first)
-    except LLMError as e:
-        log.error("Background change (%s) failed for session %d: %s", attempt, session_id, e)
-        await message.answer(
-            "Не получилось нарисовать фон: нейросеть не ответила. Попробуйте ещё раз или примите первый фон.",
-            reply_markup=background_retry_keyboard,
-        )
-        return
-    path = save_image(files_dir, session_id, "Фон_2", image)
-    await db.save_artifact(session_id, BACKGROUND_ALT, str(path), model)
-    await show_background_choice(message, first, image, attempt)
+    await message.answer("Готовлю новый вариант фона…")
+    image, _ = await presentation.draw_background(db, pipeline, files_dir, session_id, change=True)
+    await show_background_choice(message, load_image(artifacts[BACKGROUND]), image, artifacts[BACKGROUND_ATTEMPT])
 
 
 async def show_background_choice(message: Message, first: Image, second: Image, attempt: str) -> None:
@@ -901,6 +820,17 @@ async def cmd_start(message: Message) -> None:
 @router.callback_query(F.data == NEW_PRESENTATION)
 async def on_new_presentation(callback: CallbackQuery, db: Database, bank: QuestionBank) -> None:
     async with _user_locks[callback.from_user.id]:
+        if getattr(db, 'queue_settings', None):
+            from bot.web.storage import cancel, Conflict
+            async with db.transaction():
+                previous = await db.get_active_session(callback.from_user.id)
+                if previous and previous != getattr(db, 'confirm_replace_sid', None):
+                    raise Conflict('Активная презентация изменилась. Повторите создание.')
+                if previous:
+                    await cancel(db, previous)
+                session_id = await db.start_session(callback.from_user.id)
+            await ask_description(callback.message, db, session_id)
+            return
         previous = await db.get_active_session(callback.from_user.id)
         if previous is not None:
             await db.finish_session(previous, status="cancelled")
@@ -1069,7 +999,7 @@ async def on_slide_edit(callback: CallbackQuery, db: Database) -> None:
         f"Исправляем слайд {number}. Нажмите на текст ниже, чтобы скопировать его, исправьте и пришлите "
         "следующим сообщением.\n\n"
         "⚠️ Сохраните структуру: строки ЗАГОЛОВОК, ТИП и СОДЕРЖАНИЕ в этом порядке. "
-        f"ТИП — один из: {', '.join(SLIDE_TYPES)}. У схемы в содержании нужны «Блоки:» и «Связи:».\n\n"
+        f"ТИП — один из: {', '.join(SLIDE_TYPES)}. Содержимое схемы можно описать обычным текстом.\n\n"
         f"<pre>{escape(text)}</pre>",
         reply_markup=slide_cancel_keyboard,
     )
@@ -1313,7 +1243,12 @@ async def cmd_cancel(message: Message, db: Database) -> None:
         if session_id is None:
             await message.answer("Активной презентации нет.", reply_markup=start_keyboard)
             return
-        await db.finish_session(session_id, status="cancelled")
+        if getattr(db, 'queue_settings', None):
+            from bot.web.storage import cancel
+            async with db.transaction():
+                await cancel(db, session_id)
+        else:
+            await db.finish_session(session_id, status="cancelled")
         await _running.cancel(session_id)
         await message.answer("Презентация отменена.", reply_markup=start_keyboard)
 

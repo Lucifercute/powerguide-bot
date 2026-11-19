@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 PREVIEW_FILE = "preview.jpg"  # what the user sees: a collage of sample slides
@@ -40,3 +41,15 @@ class PresetStore:
 
     def get(self, number: int) -> Preset | None:
         return next((p for p in self.load() if p.number == number), None)
+
+    def html_options(self, number: int) -> dict:
+        """Private HTML-only overrides; the raster pipeline continues reading style.md."""
+        folder = self.path / str(int(number))
+        result = {}
+        passport = folder / 'style_html.md'
+        if passport.is_file():
+            result['style_description'] = passport.read_text(encoding='utf-8').strip()
+        fonts = folder / 'fonts.json'
+        if fonts.is_file():
+            result['font_policy'] = json.loads(fonts.read_text(encoding='utf-8'))
+        return result
