@@ -229,7 +229,10 @@ def assemble(plan: VisualPlan, markups: dict, style_description: str = '') -> De
                                        aspect_ratio=markup.image_aspect_ratio, prompt=markup.image_prompt,
                                        alt=markup.image_alt or spec.title))
     base = ('*,*::before,*::after{box-sizing:border-box}'
-            '#presentation-viewport section.slide{position:relative;overflow:hidden;margin:0}'
+            # The slide frame belongs to the code: a slide rule may not move or resize the section itself
+            # (an absolute, inset section shifts the HTML view and its render away from the PPTX).
+            '#presentation-viewport section.slide{position:relative!important;inset:auto!important;'
+            'margin:0!important;transform:none!important;overflow:hidden}'
             # Link labels placed by the code; a slide may restyle them with & .pg-link-label.
             '#presentation-viewport .pg-link-label{position:absolute;z-index:1;white-space:nowrap;margin:0;'
             'padding:4px 12px;border-radius:999px;font-size:20px;font-weight:600;line-height:1.2;'

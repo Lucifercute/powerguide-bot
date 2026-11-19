@@ -110,6 +110,9 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                         fonts:[...new Set(scene.flatMap(s=>s.objects.filter(o=>o.type==='text').map(o=>o.font)))],
                         backgroundCrops:scene.map(s=>s.objects.find(o=>o.type==='image')?.crop),
                         textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)})),
+                        // Text inside the slide but closer than 3 % of the width to its edge: no margin.
+                        edgeText:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>{if(o.type!=='text')return false;const m=cfg.width*.03;
+                          return o.x+o.w>0&&o.x<cfg.width&&o.y+o.h>0&&o.y<cfg.height&&(o.x<m||o.y<m*.6||o.x+o.w>cfg.width-m||o.y+o.h>cfg.height-m*.6);}).map(o=>o.text.slice(0,40))})),
                         smallText:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.fontSize<minFont-.5).map(o=>[o.text.slice(0,40),Math.round(o.fontSize)])})),
                         brokenWords:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.broken).map(o=>o.text.slice(0,60))})),
                         wordFit:scene.map((s,i)=>({slide:i+1,...s.fit})),

@@ -41,6 +41,10 @@ def slide_issues(result) -> dict:
         if row['issues']:
             add(row['slide'], 'Текст выходит за край слайда: ' + json.dumps(row['issues'][:5], ensure_ascii=False)
                 + '. Сократи отступы и размер графики, не уменьшая кегль ниже минимума.')
+    for row in result.get('edgeText', []):
+        if row['items']:
+            add(row['slide'], 'Текст прижат к краю слайда без поля: ' + json.dumps(row['items'][:4], ensure_ascii=False)
+                + '. Держи весь текст в зоне контента паспорта; поля слайда — padding у &, а не позиционирование.')
     for row in result.get('smallText', []):
         if row['items']:
             add(row['slide'], f'Кегль ниже минимума {MIN_FONT_PX} px: '

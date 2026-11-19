@@ -303,8 +303,16 @@ class EditableService:
             def render_of(n):
                 return [('Image 2: current render of this slide.',
                          (folder / f'preview-slide-{n}.png').read_bytes(), 'image/png')]
-            markups.update(await self._slides(folder, plan, repaired, repair_prompt, pictures,
-                                              background, suffix='-repair', extra_for=render_of))
+            redone = await self._slides(folder, plan, repaired, repair_prompt, pictures,
+                                        background, suffix='-repair', extra_for=render_of)
+            # A layout repair keeps the illustration: same prompt, so the cached picture is reused
+            # (only its box on the slide may change).
+            for n, markup in redone.items():
+                old = markups[n]
+                if old.image_prompt.strip() and markup.image_prompt.strip():
+                    redone[n] = markup.model_copy(update={'image_prompt': old.image_prompt, 'image_alt': old.image_alt,
+                                                          'image_aspect_ratio': old.image_aspect_ratio})
+            markups.update(redone)
         if any(s['issues'] for s in result['textBounds']):
             raise ValueError('Текст выходит за границы слайдов: ' + json.dumps(result['textBounds'], ensure_ascii=False)[:3000])
         write(completed, {'html_sha256': sha(final_html.read_bytes()), 'pptx_sha256': sha(final_pptx.read_bytes()),
