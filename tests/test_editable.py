@@ -210,6 +210,38 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Image 2: current render of this slide.', repair)
         self.assertEqual(reviewer.generate.await_count, 3)     # both slides, then the repaired one
 
+    async def test_plan_and_layout_use_their_own_models_and_thinking(self):
+        bg = self.root/'bg.png'; PILImage.new('RGB', (160, 90), 'white').save(bg)
+        await self.db.save_artifact(self.sid, BACKGROUND, str(bg))
+        await self.db.save_artifact(self.sid, STYLE, 'light')
+        await self.db.save_artifact(self.sid, PLAN.kind, 'СЛАЙД 1\nЗАГОЛОВОК: Портфолио\nСОДЕРЖАНИЕ: Проверка 12,5%\nСЛАЙД 2\nЗАГОЛОВОК: Процесс\nСОДЕРЖАНИЕ: Вход → Выход')
+        await self.db.save_artifact(self.sid, user_image_kind(2), UserImage(str(bg),160,90).to_json())
+        plan, _ = fixtures()
+        slides = {'1': SlideMarkup(css='h1{font-size:48px}', html='<section class="slide" data-slide="1" data-visual-type="cover">'
+                                   '<h1>Проверка</h1></section>'),
+                  '2': SlideMarkup(css='.node{border:2px solid blue}', html='<section class="slide" data-slide="2" data-visual-type="process">'
+                                   '<h1>Процесс</h1><div data-infographic="process"><div data-node="a" class="node">Вход</div>'
+                                   '<div data-node="b" class="node">Выход</div><div data-connector="a-b"></div></div>'
+                                   '<img data-user-slide="2" style="width:300px;height:200px;object-fit:contain"></section>')}
+        planner = SimpleNamespace(generate=AsyncMock(return_value=(plan.model_dump_json(), 'pro')))
+        async def layout(parts, *_, **__):
+            number = parts[0].split('TARGET_SLIDE\n{"data-slide": "', 1)[1][0]
+            return slides[number].model_dump_json(), 'flash'
+        llm = SimpleNamespace(generate=AsyncMock(side_effect=layout))
+        images = SimpleNamespace(generate=AsyncMock())
+        service = EditableService(llm, images, prompt_set=PromptSet('test plan', 'test html', 'test image', ''),
+                                  thinking='medium', parallel=2, planner=planner, plan_thinking='high')
+        async def render_ok(source, output, *_, **__):
+            output.write_bytes(b'pptx')
+            return {'issues': {}, 'textBounds': []}
+        with patch('bot.editable.service.chrome_path', return_value='/fake'), patch('bot.editable.service.render', AsyncMock(side_effect=render_ok)):
+            await service.generate(self.db, self.sid, self.root, AsyncMock())
+        self.assertEqual(planner.generate.await_count, 1)
+        self.assertEqual(planner.generate.await_args.args[1].thinking_config.thinking_level.name, 'HIGH')
+        self.assertEqual(llm.generate.await_count, 2)          # two slides, no repairs
+        for call in llm.generate.await_args_list:
+            self.assertEqual(call.args[1].thinking_config.thinking_level.name, 'MEDIUM')
+
     async def test_cached_generation_retries_export_without_model_calls(self):
         bg = self.root/'bg.png'; PILImage.new('RGB', (160, 90), 'white').save(bg)
         await self.db.save_artifact(self.sid, BACKGROUND, str(bg))

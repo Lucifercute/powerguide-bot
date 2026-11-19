@@ -64,7 +64,9 @@ async def main(args):
         service=EditableService(llm,images,config.prompts_dir,presets_dir=config.presets_dir,
                                 thinking=config.editable_thinking,parallel=config.editable_parallel,
                                 reviewer=TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_review_models))
-                                if config.editable_review_models else None)
+                                if config.editable_review_models else None,
+                                planner=TextLLM(config.gemini_api_key,[],config.vertex_api_key,list(config.editable_plan_models))
+                                if config.editable_plan_models else None,plan_thinking=config.editable_plan_thinking)
         source,output=await service.generate(db,args.session,out/'data/sessions',status)
         await db.finish_session(args.session)
         write(state,{'status':'completed','source_session':args.session,'html':str(source),'pptx':str(output),
@@ -75,7 +77,10 @@ async def main(args):
         raise
     finally:
         await db.close()
-        clients={id(t.client):t.client for t in llm.targets+images.targets};clients[id(llm.client)]=llm.client
+        extra=[x for x in (service.planner,service.reviewer) if x is not None and x is not llm] if 'service' in locals() else []
+        clients={id(t.client):t.client for t in llm.targets+images.targets+[t for x in extra for t in x.targets]}
+        clients[id(llm.client)]=llm.client
+        for x in extra:clients[id(x.client)]=x.client
         for client in clients.values():await client.aio.aclose()
 
 

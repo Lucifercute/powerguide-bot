@@ -27,7 +27,10 @@ class Config:
     # reasoning depth and how many slides are laid out at once.
     editable_text_models: tuple[str, ...] = ()
     editable_thinking: str = "low"
-    editable_parallel: int = 4
+    editable_parallel: int = 6
+    # Visual plan stage: own models and reasoning depth (empty = same as layout).
+    editable_plan_models: tuple[str, ...] = ()
+    editable_plan_thinking: str = "low"
     # Vision model that reviews rendered slides (empty = no review).
     editable_review_models: tuple[str, ...] = ()
 
@@ -72,13 +75,16 @@ def load_config() -> Config:
         editable_pptx_enabled=os.getenv("EDITABLE_PPTX_ENABLED", "0").lower() in {"1", "true", "yes"},
         editable_text_models=tuple(_split(os.getenv("EDITABLE_TEXT_MODELS", ""))),
         editable_thinking=_thinking(os.getenv("EDITABLE_THINKING", "low")),
-        editable_parallel=max(1, int(os.getenv("EDITABLE_PARALLEL", "4"))),
+        editable_parallel=max(1, int(os.getenv("EDITABLE_PARALLEL", "6"))),
+        editable_plan_models=tuple(_split(os.getenv("EDITABLE_PLAN_MODELS", ""))),
+        editable_plan_thinking=_thinking(os.getenv("EDITABLE_PLAN_THINKING", "")
+                                         or os.getenv("EDITABLE_THINKING", "low"), "EDITABLE_PLAN_THINKING"),
         editable_review_models=tuple(_split(os.getenv("EDITABLE_REVIEW_MODELS", ""))),
     )
 
 
-def _thinking(value: str) -> str:
+def _thinking(value: str, name: str = "EDITABLE_THINKING") -> str:
     value = value.strip().lower()
     if value not in {"low", "medium", "high"}:
-        raise RuntimeError("EDITABLE_THINKING: low, medium или high")
+        raise RuntimeError(f"{name}: low, medium или high")
     return value

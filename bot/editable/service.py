@@ -64,8 +64,12 @@ def image_data(path):
 
 class EditableService:
     def __init__(self, llm, images, prompts_dir=Path('prompts'), *, prompt_set=None, presets_dir=Path('presets'),
-                 thinking='low', parallel=4, reviewer=None):
+                 thinking='low', parallel=6, reviewer=None, planner=None, plan_thinking=None):
         self.llm, self.images = llm, images
+        # The visual plan decides the whole deck: it may use a stronger model and deeper reasoning
+        # than the per-slide layout and repairs.
+        self.planner = planner or llm
+        self.plan_thinking = plan_thinking or thinking
         # Optional cheap vision model that looks at each rendered slide for visible defects.
         self.reviewer = reviewer
         self.prompts_dir = Path(prompts_dir)
@@ -74,12 +78,13 @@ class EditableService:
         self.thinking = thinking
         self.parallel = parallel
 
-    def _config(self, schema):
+    def _config(self, schema, thinking):
         return types.GenerateContentConfig(
             response_mime_type='application/json', response_schema=schema, max_output_tokens=MAX_OUTPUT_TOKENS,
-            thinking_config=types.ThinkingConfig(thinking_level=THINKING[self.thinking]))
+            thinking_config=types.ThinkingConfig(thinking_level=THINKING[thinking]))
 
-    async def _json_stage(self, folder, name, prompt, schema, validate, background, *, normalize=None, extra=()):
+    async def _json_stage(self, folder, name, prompt, schema, validate, background, *, normalize=None, extra=(),
+                          planning=False):
         """Request, validate and cache one structured answer; up to two corrective retries.
         extra: (caption, bytes, mime) images sent after the background."""
         final = folder / f'{name}.json'
@@ -89,6 +94,7 @@ class EditableService:
                 value = normalize(value)
             validate(value)
             return value
+        llm, thinking = (self.planner, self.plan_thinking) if planning else (self.llm, self.thinking)
         feedback = ''
         # Revalidate saved responses first; each explicit retry may make at most
         # two additional requests if earlier responses still violate the contract.
@@ -101,12 +107,12 @@ class EditableService:
                 write(prefix.with_suffix('.request.json'), {
                     'prompt': actual, 'background_sha256': sha(background[0]), 'schema': schema.model_json_schema(),
                     'images': [{'caption': c, 'sha256': sha(d)} for c, d, _ in extra],
-                    'config': {'thinking_level': self.thinking, 'max_output_tokens': MAX_OUTPUT_TOKENS}})
+                    'config': {'thinking_level': thinking, 'max_output_tokens': MAX_OUTPUT_TOKENS}})
                 usage = {}
                 parts = [actual, 'Image 1: exact background.', types.Part.from_bytes(data=background[0], mime_type=background[1])]
                 for caption, data, mime in extra:
                     parts += [caption, types.Part.from_bytes(data=data, mime_type=mime)]
-                text, model = await self.llm.generate(parts, self._config(schema), usage=usage)
+                text, model = await llm.generate(parts, self._config(schema, thinking), usage=usage)
                 write(raw, {'model': model, 'text': text, 'usage': usage})
             saved = read_json(raw)
             try:
@@ -142,7 +148,7 @@ class EditableService:
         if not self.reviewer or not instructions.REVIEW.strip():
             return {}
         specs = {s.number: s for s in plan.slides}
-        gate = asyncio.Semaphore(4)
+        gate = asyncio.Semaphore(self.parallel)
         config = types.GenerateContentConfig(
             response_mime_type='application/json', response_schema=SlideReview, max_output_tokens=4096,
             thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW))
@@ -262,7 +268,8 @@ class EditableService:
 
         await status('Проектирую слайды для редактируемой презентации…')
         plan = await self._json_stage(folder, 'visual-plan', instructions.PLAN + '\nINPUT\n' + json.dumps(context, ensure_ascii=False),
-                                      VisualPlan, lambda p: validate_plan(p, len(numbers)), background)
+                                      VisualPlan, lambda p: validate_plan(p, len(numbers)), background,
+                                      planning=True)
 
         await status('Верстаю слайды…')
         layout_input = {k: v for k, v in context.items() if k not in LAYOUT_OMITS}
