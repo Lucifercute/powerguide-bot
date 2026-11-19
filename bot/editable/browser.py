@@ -13,12 +13,15 @@ import aiohttp
 from lxml import etree
 from pptx import Presentation
 from .composition import composition_issues
+from .layout import MIN_FONT_PX, layout_issues, slide_issues
 
 
 def chrome_path():
     configured = os.getenv('EDITABLE_CHROME_PATH')
     candidates = [configured] if configured else [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        *(str(Path(os.environ.get(v, '')) / 'Google/Chrome/Application/chrome.exe')
+          for v in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA') if os.environ.get(v)),
         shutil.which('google-chrome'), shutil.which('chromium'), shutil.which('chromium-browser')]
     for p in candidates:
         if p and Path(p).is_file():
@@ -99,21 +102,24 @@ async def render(source: Path, output: Path, count: int, width: int, height: int
                     result = await cdp.evaluate('''(async()=>{
                       if([...document.images].some(i=>!i.complete||!i.naturalWidth))throw Error('Broken image');
                       const scene=await PowerGuidePptx.collectSlides(), cfg=POWERGUIDE_EXPORT_CONFIG;
+                      const minFont=''' + str(MIN_FONT_PX) + '''*cfg.width/1600;
                       const result=PowerGuidePptx.buildPptx(scene,POWERGUIDE_PPTX_TEMPLATE);
                       let binary='';for(let i=0;i<result.bytes.length;i+=32768)binary+=String.fromCharCode(...result.bytes.subarray(i,i+32768));
                       return {pptx:btoa(binary),counters:result.counters,
                         composition:scene.map(s=>s.composition),
                         fonts:[...new Set(scene.flatMap(s=>s.objects.filter(o=>o.type==='text').map(o=>o.font)))],
                         backgroundCrops:scene.map(s=>s.objects.find(o=>o.type==='image')?.crop),
-                        textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)}))};
+                        textBounds:scene.map((s,i)=>({slide:i+1,issues:s.objects.filter(o=>o.type==='text'&&(o.x< -3||o.y< -3||o.x+o.w>cfg.width+6||o.y+o.h>cfg.height+6)).map(o=>o.text)})),
+                        smallText:scene.map((s,i)=>({slide:i+1,items:s.objects.filter(o=>o.type==='text'&&o.fontSize<minFont-.5).map(o=>[o.text.slice(0,40),Math.round(o.fontSize)])})),
+                        layout:scene.map(s=>s.layout)};
                     })()''')
                     data = base64.b64decode(result.pop('pptx'))
                     result['compositionIssues'] = composition_issues(result.get('composition', []))
-                    (source.parent / 'export-check.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
-                    if any(s['issues'] for s in result['textBounds']):
-                        raise ValueError('Текст выходит за границы слайдов: ' + json.dumps(result['textBounds'], ensure_ascii=False)[:3000])
-                    if result['compositionIssues']:
-                        raise ValueError('Однообразие композиции: ' + json.dumps(result['compositionIssues'], ensure_ascii=False))
+                    result['layoutIssues'] = layout_issues(result.get('layout', []))
+                    # Quality findings are hints per slide; the caller decides whether to redo them.
+                    result['issues'] = slide_issues(result)
+                    (source.parent / 'export-check.json').write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                                                                     encoding='utf-8')
                     await asyncio.to_thread(validate_pptx, data, count, width, height)
                     tmp = output.with_suffix('.pptx.tmp')
                     tmp.write_bytes(data)

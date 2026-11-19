@@ -22,6 +22,8 @@ class Node(BaseModel):
     id:str
     label:str
     detail:str
+    # What the icon depicts (a short concept), or "" when the node has none.
+    icon:str = ''
 
 
 class Edge(BaseModel):
@@ -43,6 +45,8 @@ class SlidePlan(BaseModel):
     visual_type:Literal['cover','process','timeline','matrix','before_after','comparison','bar_chart','stack_map','network','table','closing','text']
     composition:str
     form:str | None = None
+    # Subject of a generated illustration for this slide, or "" when none.
+    illustration:str = ''
     nodes:list[Node]
     edges:list[Edge]
     metrics:list[Metric]
@@ -77,3 +81,12 @@ class Deck(BaseModel):
     title:str
     html:str
     images:list[Illustration] = Field(default_factory=list, max_length=3)
+
+
+class SlideMarkup(BaseModel):
+    """One slide laid out by the model; the code assembles and scopes the deck."""
+    css:str
+    html:str
+    image_prompt:str = ''
+    image_alt:str = ''
+    image_aspect_ratio:Literal['1:1','4:3','3:4','16:9'] = '4:3'

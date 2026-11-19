@@ -14,6 +14,11 @@ def create_pipeline(config):
         prompts_dir=config.prompts_dir, max_queries=config.search_max_queries,
     )
     pipeline.editable_enabled = config.editable_pptx_enabled
-    pipeline.editable_service = EditableService(pipeline.llm, pipeline.images, config.prompts_dir,
-                                                presets_dir=config.presets_dir)
+    editable_llm = pipeline.llm
+    if config.editable_text_models:
+        # Layout quality depends on the model most: allow a stronger one only for these stages.
+        editable_llm = TextLLM(config.gemini_api_key, [], config.vertex_api_key, list(config.editable_text_models))
+    pipeline.editable_service = EditableService(editable_llm, pipeline.images, config.prompts_dir,
+                                                presets_dir=config.presets_dir, thinking=config.editable_thinking,
+                                                parallel=config.editable_parallel)
     return pipeline

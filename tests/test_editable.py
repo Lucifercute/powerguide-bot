@@ -12,7 +12,7 @@ from PIL import Image as PILImage
 from bot import generation_modes as modes
 from bot.db import Database
 from bot.editable.html import package, validate_deck
-from bot.editable.models import Deck, VisualPlan
+from bot.editable.models import Deck, SlideMarkup, VisualPlan
 from bot.editable.prompts import PromptSet, load as load_private_prompts
 from bot.editable.service import EditableService
 from bot.pipeline import BACKGROUND, BACKGROUND_ACCEPTED, PLAN, STYLE, DESCRIPTIONS, user_image_kind
@@ -178,11 +178,22 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
         await self.db.save_artifact(self.sid, STYLE, 'light')
         await self.db.save_artifact(self.sid, PLAN.kind, 'СЛАЙД 1\nЗАГОЛОВОК: Портфолио\nСОДЕРЖАНИЕ: Проверка 12,5%\nСЛАЙД 2\nЗАГОЛОВОК: Процесс\nСОДЕРЖАНИЕ: Вход → Выход')
         await self.db.save_artifact(self.sid, user_image_kind(2), UserImage(str(bg),160,90).to_json())
-        plan, deck = fixtures()
-        llm = SimpleNamespace(generate=AsyncMock(side_effect=[(plan.model_dump_json(),'fake'), (deck.model_dump_json(),'fake')]))
+        plan, _ = fixtures()
+        plan.slides[0].illustration = 'Портфолио'
+        slides = [SlideMarkup(css='h1{font-size:48px}', html='<section class="slide" data-slide="1" data-visual-type="cover">'
+                              '<h1>Проверка</h1><img data-asset-id="slide-1-image" style="width:160px;height:160px"></section>',
+                              image_prompt='Conceptual illustration', image_alt='Иллюстрация'),
+                  SlideMarkup(css='.node{border:2px solid blue}', html='<section class="slide" data-slide="2" data-visual-type="process">'
+                              '<h1>Процесс</h1><div data-infographic="process"><div data-node="a" class="node">Вход</div>'
+                              '<div data-node="b" class="node">Выход</div><div data-connector="a-b"></div></div>'
+                              '<img data-user-slide="2" style="width:300px;height:200px;object-fit:contain"></section>')]
+        answers = [(plan.model_dump_json(), 'fake')] + [(s.model_dump_json(), 'fake') for s in slides]
+        llm = SimpleNamespace(generate=AsyncMock(side_effect=answers))
         images = SimpleNamespace(generate=AsyncMock(return_value=(SimpleNamespace(data=bg.read_bytes(),mime_type='image/png'),'fake')))
-        service = EditableService(llm, images, prompt_set=PromptSet('test plan', 'test html', 'test image'))
-        async def render_ok(source, output, *_): output.write_bytes(b'pptx')
+        service = EditableService(llm, images, prompt_set=PromptSet('test plan', 'test html', 'test image'), parallel=1)
+        async def render_ok(source, output, *_, **__):
+            output.write_bytes(b'pptx')
+            return {'issues': {}, 'textBounds': []}
         with patch('bot.editable.service.chrome_path', return_value='/fake'), patch('bot.editable.service.render', AsyncMock(side_effect=RuntimeError('browser down'))):
             with self.assertRaises(RuntimeError):
                 await service.generate(self.db,self.sid,self.root,AsyncMock())
@@ -190,7 +201,7 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
             await service.generate(self.db,self.sid,self.root,AsyncMock())
             await service.generate(self.db,self.sid,self.root,AsyncMock())
             renderer.assert_awaited_once()
-        self.assertEqual(llm.generate.await_count,2)
+        self.assertEqual(llm.generate.await_count,3)
         images.generate.assert_awaited_once()
 
 

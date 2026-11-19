@@ -1,56 +1,16 @@
-"""Stable layout regions and typography roles around model-authored content."""
-import re
-from lxml import html
+"""Rendered-layout findings per slide, phrased as instructions for the model."""
+import json
 
-LAYOUT_CSS = '''
-#presentation-viewport section.slide[data-visual-type="cover"] {
-  justify-content:center!important;
-}
-#presentation-viewport [data-pg-layout-frame] {
-  flex:1 1 0!important; min-height:0; display:flex; flex-direction:column;
-  justify-content:center; align-items:stretch;
-}
-#presentation-viewport [data-pg-layout-frame] > [data-infographic] {
-  flex-shrink:0; margin-top:0!important; margin-bottom:0!important;
-}
-'''
-
-
-def prepare_layout(doc):
-    """Wrap standalone infographics without flattening authored multicolumn layouts."""
-    for section in doc.xpath('//section[contains(concat(" ",normalize-space(@class)," ")," slide ")]'):
-        if not section.xpath('.//*[@data-layout-main]'):
-            direct = section.xpath('./*[@data-infographic]')
-            if len(direct) == 1:
-                graph = direct[0]
-                frame = html.Element('div', attrib={'data-layout-main': '', 'data-pg-layout-frame': ''})
-                section.replace(graph, frame)
-                frame.append(graph)
-            else:
-                graphs = section.xpath('.//*[@data-infographic]')
-                if len(graphs) == 1:
-                    frame = graphs[0]
-                    while frame.getparent() is not section:
-                        frame = frame.getparent()
-                    frame.set('data-layout-main', '')
-        for el in section.iterdescendants():
-            if not isinstance(el.tag, str) or el.get('data-font-role'):
-                continue
-            classes = el.get('class', '').lower()
-            words = set(re.split(r'[-_\s]+', classes))
-            if el.tag.lower() in {'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'th'} or words & {'title', 'heading', 'header'}:
-                el.set('data-font-role', 'heading')
-            elif words & {'num', 'number', 'numbers', 'value', 'val'}:
-                el.set('data-font-role', 'numbers')
-            elif not len(el) and re.match(r'^\s*[±+−-]?\d', el.text or ''):
-                el.set('data-font-role', 'numbers')
+# Smallest readable size on a 1600 px wide slide (scaled for other canvases).
+MIN_FONT_PX = 18
+EXEMPT = {'cover', 'closing'}
 
 
 def layout_issues(rows):
-    """Detect small content inside a large layout frame, not just the frame size."""
+    """Content that is small inside the free area below the title, or sits in its top part."""
     issues = []
     for row in rows:
-        if row.get('exempt') or not row.get('region') or not row.get('content'):
+        if not row or row.get('visualType') in EXEMPT or not row.get('region') or not row.get('content'):
             continue
         region, content = row['region'], row['content']
         if region['h'] <= 0:
@@ -58,14 +18,37 @@ def layout_issues(rows):
         coverage = content['h'] / region['h']
         lower = (region['y'] + region['h'] - content['y'] - content['h']) / region['h']
         upper = (content['y'] - region['y']) / region['h']
-        if coverage < .45:
-            issues.append({'slide': row['slide'], 'reason': 'undersized_infographic',
-                           'height_coverage': round(coverage, 3),
-                           'hint': 'Увеличь сами узлы, диаграмму, строки таблицы и читаемый текст; '
-                                   'содержимое должно занимать минимум 45% высоты основной зоны. '
-                                   'Растягивание пустого контейнера не исправляет проблему.'})
-        elif lower > .30 and lower - upper > .20:
-            issues.append({'slide': row['slide'], 'reason': 'top_heavy',
-                           'lower_gap': round(lower, 3),
-                           'hint': 'Сбалансируй содержимое основной зоны по вертикали.'})
+        if coverage < .55:
+            issues.append({'slide': row['slide'], 'reason': 'undersized_content', 'height_coverage': round(coverage, 3),
+                           'hint': f'Содержимое занимает {coverage:.0%} высоты свободной зоны под заголовком. '
+                                   'Увеличь сами элементы — узлы, диаграмму, числа, иконки, кегль основного текста — '
+                                   'чтобы они занимали не меньше 60–70 % высоты зоны. Растягивание пустых контейнеров '
+                                   'и добавление новых фактов не решают задачу.'})
+        elif lower > .25 and lower - upper > .15:
+            issues.append({'slide': row['slide'], 'reason': 'top_heavy', 'lower_gap': round(lower, 3),
+                           'hint': f'Нижние {lower:.0%} свободной зоны пусты: содержимое прижато вверх. '
+                                   'Распредели его по высоте зоны или увеличь масштаб главного элемента.'})
     return issues
+
+
+def slide_issues(result) -> dict:
+    """{slide: [hints]} from all rendered checks."""
+    found = {}
+
+    def add(slide, hint):
+        found.setdefault(int(slide), []).append(hint)
+    for row in result.get('textBounds', []):
+        if row['issues']:
+            add(row['slide'], 'Текст выходит за край слайда: ' + json.dumps(row['issues'][:5], ensure_ascii=False)
+                + '. Сократи отступы и размер графики, не уменьшая кегль ниже минимума.')
+    for row in result.get('smallText', []):
+        if row['items']:
+            add(row['slide'], f'Кегль ниже минимума {MIN_FONT_PX} px: '
+                + json.dumps(row['items'][:6], ensure_ascii=False) + '. Подними кегль, при нехватке места — '
+                'перестрой композицию или сократи отступы.')
+    for issue in result.get('layoutIssues', []):
+        add(issue['slide'], issue['hint'])
+    for issue in result.get('compositionIssues', []):
+        for slide in issue['slides']:
+            add(slide, issue['hint'])
+    return found

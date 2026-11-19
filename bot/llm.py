@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,12 +87,14 @@ class TextLLM:
             raise ValueError("no text models configured: set GEMINI_TEXT_MODELS and/or VERTEX_TEXT_MODELS")
 
     async def generate(
-        self, contents: types.ContentListUnion, config: types.GenerateContentConfig | None = None
+        self, contents: types.ContentListUnion, config: types.GenerateContentConfig | None = None,
+        *, usage: dict | None = None,
     ) -> tuple[str, str]:
         """Return (text, name of the model that produced it).
 
-        contents is a prompt string, or a list of parts, e.g. [image Part, prompt]."""
-        return await _generate_with_fallback(self.targets, contents, config, lambda r: r.text or None)
+        contents is a prompt string, or a list of parts, e.g. [image Part, prompt].
+        A passed usage dict receives token counts and seconds of the successful call."""
+        return await _generate_with_fallback(self.targets, contents, config, lambda r: r.text or None, usage=usage)
 
     async def upload(self, path: Path, mime_type: str) -> types.Part:
         """Upload a file to the Gemini File API (kept there 48 hours) and return a Part
@@ -112,14 +115,15 @@ class ImageLLM:
         client = _vertex_client(api_key)
         self.targets = [_Target(client, m, m) for m in models]
 
-    async def generate(self, contents: types.ContentListUnion, aspect_ratio: str) -> tuple[Image, str]:
+    async def generate(self, contents: types.ContentListUnion, aspect_ratio: str,
+                       *, usage: dict | None = None) -> tuple[Image, str]:
         """Return (image, name of the model that produced it)."""
         config = types.GenerateContentConfig(
             response_modalities=["IMAGE"],
             image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
         )
         return await _generate_with_fallback(
-            self.targets, contents, config, _first_image, retry_delays=IMAGE_RETRY_DELAYS
+            self.targets, contents, config, _first_image, retry_delays=IMAGE_RETRY_DELAYS, usage=usage
         )
 
 
@@ -129,6 +133,7 @@ async def _generate_with_fallback(
     config: types.GenerateContentConfig | None,
     extract: Callable[[types.GenerateContentResponse], T | None],
     retry_delays: tuple[int, ...] = RETRY_DELAYS,
+    usage: dict | None = None,
 ) -> tuple[T, str]:
     """Try each model in order with retries; return (extract(response), model name).
 
@@ -137,6 +142,7 @@ async def _generate_with_fallback(
     last_error: Exception | None = None
     for target in targets:
         for attempt in range(len(retry_delays) + 1):
+            started = time.monotonic()
             try:
                 response = await target.client.aio.models.generate_content(
                     model=target.model, contents=contents, config=config
@@ -158,6 +164,9 @@ async def _generate_with_fallback(
             result = extract(response)
             if result is not None:
                 log.info("Gemini %s ok on attempt %d, %s", target.name, attempt + 1, _usage(response))
+                if usage is not None:
+                    usage.update(_usage_dict(response), model=target.name,
+                                 seconds=round(time.monotonic() - started, 1))
                 return result, target.name
             log.warning(
                 "Gemini %s returned an empty result (finish reason: %s)", target.name, _finish_reason(response)
@@ -193,6 +202,14 @@ def _usage(response: types.GenerateContentResponse) -> str:
         f"tokens: in={usage.prompt_token_count or 0} out={usage.candidates_token_count or 0} "
         f"thinking={usage.thoughts_token_count or 0}"
     )
+
+
+def _usage_dict(response: types.GenerateContentResponse) -> dict:
+    usage = response.usage_metadata
+    if usage is None:
+        return {}
+    return {"input": usage.prompt_token_count or 0, "output": usage.candidates_token_count or 0,
+            "thinking": usage.thoughts_token_count or 0}
 
 
 def _first_image(response: types.GenerateContentResponse) -> Image | None:

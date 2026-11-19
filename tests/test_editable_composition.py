@@ -52,12 +52,13 @@ class BrowserCompositionTests(unittest.IsolatedAsyncioTestCase):
             </script><script>{exporter.read_text()}</script></body></html>'''
         with tempfile.TemporaryDirectory() as directory:
             p=Path(directory);(p/'test.html').write_text(source)
-            with self.assertRaisesRegex(ValueError,'Однообразие композиции'):
-                await render(p/'test.html',p/'test.pptx',4,1600,900)
-            report=json.loads((p/'export-check.json').read_text())
+            result=await render(p/'test.html',p/'test.pptx',4,1600,900)
+            report=json.loads((p/'export-check.json').read_text(encoding='utf-8'))
             self.assertEqual([r['panelCount'] for r in report['composition']],[3]*4)
             self.assertEqual(report['compositionIssues'][0]['slides'],[1,2,3,4])
-            self.assertFalse((p/'test.pptx').exists())
+            # Monotony is a per-slide hint for a targeted redo, not an export failure.
+            self.assertEqual(sorted(result['issues']),[1,2,3,4])
+            self.assertTrue(any('плашк' in h for h in result['issues'][1]))
 
 
 if __name__=='__main__':unittest.main()

@@ -193,7 +193,12 @@ function shapeXML(o,id){
  return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${esc(o.name||'Editable shape')}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>${transform(o)}${geometry}${fillXML(o.fill)}${strokeXML(o.stroke)}</p:spPr></p:sp>`;
 }
 function textXML(o,id){
- return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${esc(o.text.slice(0,65))}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr>${transform(o)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/>${strokeXML(null)}</p:spPr><p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"><a:noAutofit/></a:bodyPr><a:lstStyle/><a:p><a:pPr algn="l"/><a:r><a:rPr lang="ru-RU" sz="${Math.round(o.fontSize*60)}" b="${o.bold?1:0}" i="${o.italic?1:0}"${o.spacing?` spc="${Math.round(o.spacing*60)}"`:''}>${solid(o.color)}<a:latin typeface="${esc(o.font)}"/><a:ea typeface="${esc(o.font)}"/><a:cs typeface="${esc(o.font)}"/></a:rPr><a:t xml:space="preserve">${esc(o.text)}</a:t></a:r><a:endParaRPr lang="ru-RU"/></a:p></p:txBody></p:sp>`;
+ const props=`<a:rPr lang="ru-RU" sz="${Math.round(o.fontSize*60)}" b="${o.bold?1:0}" i="${o.italic?1:0}"${o.spacing?` spc="${Math.round(o.spacing*60)}"`:''}>${solid(o.color)}<a:latin typeface="${esc(o.font)}"/><a:ea typeface="${esc(o.font)}"/><a:cs typeface="${esc(o.font)}"/></a:rPr>`;
+ // A wrapped paragraph stays one editable box: the browser's line breaks become
+ // explicit breaks and the CSS line pitch becomes exact line spacing.
+ const lines=o.lines||[o.text],spacing=o.pitch?`<a:lnSpc><a:spcPts val="${Math.round(o.pitch*60)}"/></a:lnSpc>`:'';
+ const runs=lines.map(text=>`<a:r>${props}<a:t xml:space="preserve">${esc(text)}</a:t></a:r>`).join(`<a:br>${props}</a:br>`);
+ return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${esc(o.text.slice(0,65))}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr>${transform(o)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/>${strokeXML(null)}</p:spPr><p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"><a:noAutofit/></a:bodyPr><a:lstStyle/><a:p><a:pPr algn="${o.align||'l'}">${spacing}</a:pPr>${runs}<a:endParaRPr lang="ru-RU"/></a:p></p:txBody></p:sp>`;
 }
 function pictureXML(o,id,rid){
  const crop=o.crop?`<a:srcRect l="${Math.round(o.crop.l*100000)}" t="${Math.round(o.crop.t*100000)}" r="${Math.round(o.crop.r*100000)}" b="${Math.round(o.crop.b*100000)}"/>`:'';
@@ -319,9 +324,17 @@ function textObjects(node,root){
   if(!line||Math.abs(line.y-r.y)>2){line={text:'',x:r.x,y:r.y,right:r.right,h:r.height};lines.push(line);}
   line.text+=node.textContent[i];line.right=Math.max(line.right,r.right);
  }
- for(const line of lines){if(!line.text.trim())continue;let text=line.text.replace(/\s+/g,' ');if(c.textTransform==='uppercase')text=text.toUpperCase();if(c.textTransform==='lowercase')text=text.toLowerCase();
-  const font=c.fontFamily.split(',')[0].replace(/["']/g,'');
-  objects.push({type:'text',text,x:line.x-root.x,y:line.y-root.y,w:line.right-line.x+5,h:line.h,fontSize:parseFloat(c.fontSize)*fontScale,font:/system|-apple|BlinkMac/i.test(font)?'Arial':font,bold:parseInt(c.fontWeight)>=600,italic:c.fontStyle==='italic',color:svgMatrix?(color(c.fill)||color(c.color)):color(c.color),spacing:parseFloat(c.letterSpacing)||0});
+ const font=c.fontFamily.split(',')[0].replace(/["']/g,'');
+ const base={type:'text',fontSize:parseFloat(c.fontSize)*fontScale,font:/system|-apple|BlinkMac/i.test(font)?'Arial':font,bold:parseInt(c.fontWeight)>=600,italic:c.fontStyle==='italic',color:svgMatrix?(color(c.fill)||color(c.color)):color(c.color),spacing:parseFloat(c.letterSpacing)||0};
+ const kept=lines.filter(l=>l.text.trim()).map(l=>{let text=l.text.replace(/\s+/g,' ').trim();if(c.textTransform==='uppercase')text=text.toUpperCase();if(c.textTransform==='lowercase')text=text.toLowerCase();return {...l,text};});
+ if(kept.length===1||svgMatrix){
+  for(const line of kept)objects.push({...base,text:line.text,x:line.x-root.x,y:line.y-root.y,w:line.right-line.x+5,h:line.h});
+ }else if(kept.length){
+  const left=Math.min(...kept.map(l=>l.x)),right=Math.max(...kept.map(l=>l.right)),first=kept[0],last=kept.at(-1);
+  const pitch=(last.y-first.y)/(kept.length-1),top=first.y-(pitch-first.h)/2;
+  const align=/center/.test(c.textAlign)?'ctr':/right|end/.test(c.textAlign)?'r':'l';
+  objects.push({...base,text:kept.map(l=>l.text).join(' '),lines:kept.map(l=>l.text),pitch,align,
+   x:left-root.x,y:top-root.y,w:right-left+5,h:pitch*kept.length});
  }
  return applyOpacity(objects,opacityOf(el));
 }
@@ -371,6 +384,18 @@ function measureComposition(slide,root){
   panelCount:panels.length,panelAreaRatio:Math.round(Math.min(1,panels.reduce((sum,p)=>sum+p.box.w*p.box.h,0)/(W*H))*1000)/1000,
   panels:panels.map(p=>Object.fromEntries(Object.entries(p.box).map(([k,v])=>[k,Math.round(v)])))};
 }
+function measureLayout(slide,objects,number){
+ // Free area: below the title (largest text in the upper third) to the bottom margin.
+ const texts=objects.filter(o=>o.type==='text'),largest=Math.max(0,...texts.map(o=>o.fontSize));
+ const titles=texts.filter(o=>o.fontSize>=largest-.5&&o.y<H*.35);
+ const top=titles.length?Math.max(...titles.map(o=>o.y+o.h))+H*.02:H*.08,bottom=H*.94;
+ const smallest=Math.min(...texts.map(o=>o.fontSize));
+ const body=objects.filter(o=>!titles.includes(o)&&o.name!=='Original preset raster background'&&o.y+o.h>top&&o.y<bottom&&o.w*o.h>16
+  &&!(o.type==='text'&&o.fontSize<=smallest+.5&&o.y>bottom-H*.12)&&!(o.w>W*.9&&o.h>H*.5));
+ if(!body.length)return {slide:number,visualType:slide.dataset.visualType,region:{y:top,h:bottom-top},content:null};
+ const y0=Math.max(top,Math.min(...body.map(o=>o.y))),y1=Math.min(bottom,Math.max(...body.map(o=>o.y+o.h)));
+ return {slide:number,visualType:slide.dataset.visualType,region:{y:Math.round(top),h:Math.round(bottom-top)},content:{y:Math.round(y0),h:Math.round(Math.max(0,y1-y0))}};
+}
 async function collectSlides(){
  normalizeFonts();
  await document.fonts.ready;
@@ -410,7 +435,7 @@ async function collectSlides(){
     for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects,composition:measureComposition(slide,root)});
+   results.push({background:visibleBackground(slide),objects,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}

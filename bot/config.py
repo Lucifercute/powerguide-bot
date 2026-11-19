@@ -23,6 +23,11 @@ class Config:
     files_dir: Path
     libreoffice_path: str | None  # None: Word/PowerPoint files are read as text only
     editable_pptx_enabled: bool = False
+    # Editable PPTX stages: own Vertex models (empty = the common text models),
+    # reasoning depth and how many slides are laid out at once.
+    editable_text_models: tuple[str, ...] = ()
+    editable_thinking: str = "low"
+    editable_parallel: int = 4
 
 
 def _required(name: str) -> str:
@@ -63,4 +68,14 @@ def load_config() -> Config:
         files_dir=Path(os.getenv("FILES_DIR", "data/sessions")),
         libreoffice_path=os.getenv("LIBREOFFICE_PATH") or _find_libreoffice(),
         editable_pptx_enabled=os.getenv("EDITABLE_PPTX_ENABLED", "0").lower() in {"1", "true", "yes"},
+        editable_text_models=tuple(_split(os.getenv("EDITABLE_TEXT_MODELS", ""))),
+        editable_thinking=_thinking(os.getenv("EDITABLE_THINKING", "low")),
+        editable_parallel=max(1, int(os.getenv("EDITABLE_PARALLEL", "4"))),
     )
+
+
+def _thinking(value: str) -> str:
+    value = value.strip().lower()
+    if value not in {"low", "medium", "high"}:
+        raise RuntimeError("EDITABLE_THINKING: low, medium или high")
+    return value
