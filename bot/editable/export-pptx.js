@@ -446,94 +446,6 @@ function fitWords(slide,minFont){
  }
  return {fitted,failed};
 }
-// Links of a diagram are drawn by the code from the plan's edges (data-links on the
-// infographic container) between measured data-node boxes: the model cannot see where its
-// nodes land, so hand-drawn connectors miss them. Style comes from CSS variables
-// --link-color, --link-width, --link-shape (straight | elbow | curve); labels use .pg-link-label.
-const LINK_SHAPES={tree:'elbow',decision:'elbow',cycle:'curve',steps:'straight',hub:'straight',network:'straight'};
-function drawLinks(g){
- let links;try{links=JSON.parse(g.dataset.links||'[]');}catch{links=[];}
- g.querySelectorAll(':scope>.pg-links,:scope>.pg-link-label').forEach(e=>e.remove());
- if(!links.length)return [];
- const cg=getComputedStyle(g);
- if(cg.position==='static')g.style.position='relative';
- if(cg.zIndex==='auto')g.style.zIndex='0';
- const box=g.getBoundingClientRect();if(!box.width||!box.height)return [];
- const ox=box.left+g.clientLeft,oy=box.top+g.clientTop;
- const form=g.closest('section')?.dataset.form||'';
- const shape=cg.getPropertyValue('--link-shape').trim()||LINK_SHAPES[form]||'straight';
- const width=parseFloat(cg.getPropertyValue('--link-width'))||3,arrow=Math.max(9,width*3),gap=6;
- const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');
- svg.setAttribute('class','pg-links');svg.setAttribute('width',g.clientWidth);svg.setAttribute('height',g.clientHeight);
- svg.setAttribute('viewBox',`0 0 ${g.clientWidth} ${g.clientHeight}`);
- svg.style.cssText=`position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:-1;color:${cg.getPropertyValue('--link-color').trim()||'currentColor'}`;
- g.prepend(svg);
- // A line joins the visible mark of a node (its icon container: circle, hexagon, tile),
- // not the whole group with its caption; data-anchor inside a node overrides the choice.
- const anchorOf=node=>{
-  const own=node.querySelector('[data-anchor]');if(own)return own;
-  const icon=node.querySelector('svg[data-icon]');
-  for(let e=icon?.parentElement;e&&e!==node.parentElement;e=e.parentElement){
-   const s=getComputedStyle(e);
-   if(e===node||s.backgroundColor!=='rgba(0, 0, 0, 0)'||parseFloat(s.borderTopWidth)>0||s.clipPath!=='none')return e;
-  }
-  return node;
- };
- const local=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);
-  const round=parseFloat(s.borderTopLeftRadius)>=Math.min(r.width,r.height)/2-1||s.clipPath.startsWith('circle')||s.clipPath.startsWith('ellipse');
-  return{l:r.left-ox,t:r.top-oy,r:r.right-ox,b:r.bottom-oy,x:(r.left+r.right)/2-ox,y:(r.top+r.bottom)/2-oy,round};};
- // Point on the outline of a (plus gap) on the way from its centre towards p: ellipse for round marks.
- const exit=(a,p)=>{const dx=p[0]-a.x,dy=p[1]-a.y,hw=(a.r-a.l)/2+gap,hh=(a.b-a.t)/2+gap;
-  const k=a.round?1/Math.max(Math.hypot(dx/hw,dy/hh),1e-9):1/Math.max(Math.abs(dx)/hw||0,Math.abs(dy)/hh||0,1e-9);
-  return[a.x+dx*k,a.y+dy*k];};
- const missing=[];
- for(const [from,to,label] of links){
-  const na=g.querySelector(`[data-node="${CSS.escape(from)}"]`),nb=g.querySelector(`[data-node="${CSS.escape(to)}"]`);
-  if(!na||!nb){missing.push(!na?from:to);continue;}
-  const a=local(anchorOf(na)),b=local(anchorOf(nb)),dx=b.x-a.x,dy=b.y-a.y,horizontal=Math.abs(dx)>=Math.abs(dy);
-  let s,e,dir;
-  if(shape==='straight'){s=exit(a,[b.x,b.y]);e=exit(b,[a.x,a.y]);const len=Math.hypot(e[0]-s[0],e[1]-s[1])||1;dir=[(e[0]-s[0])/len,(e[1]-s[1])/len];}
-  else if(horizontal){s=[dx>0?a.r+gap:a.l-gap,a.y];e=[dx>0?b.l-gap:b.r+gap,b.y];dir=[Math.sign(dx),0];}
-  else{s=[a.x,dy>0?a.b+gap:a.t-gap];e=[b.x,dy>0?b.t-gap:b.b+gap];dir=[0,Math.sign(dy)];}
-  const end=[e[0]-dir[0]*arrow,e[1]-dir[1]*arrow];
-  let d;
-  if(shape==='straight')d=`M${s} L${end}`;
-  else if(shape==='elbow')d=horizontal?`M${s} H${(s[0]+end[0])/2} V${end[1]} H${end[0]}`:`M${s} V${(s[1]+end[1])/2} H${end[0]} V${end[1]}`;
-  else d=horizontal?`M${s} C${(s[0]+end[0])/2},${s[1]} ${(s[0]+end[0])/2},${end[1]} ${end}`:`M${s} C${s[0]},${(s[1]+end[1])/2} ${end[0]},${(s[1]+end[1])/2} ${end}`;
-  const path=document.createElementNS(ns,'path');
-  for(const [k,v] of Object.entries({d,fill:'none',stroke:'currentColor','stroke-width':width,'stroke-linecap':'round','stroke-linejoin':'round','data-link':`${from}>${to}`}))path.setAttribute(k,v);
-  svg.appendChild(path);
-  const perp=[-dir[1],dir[0]],head=document.createElementNS(ns,'polygon');
-  head.setAttribute('points',[e,[end[0]+perp[0]*arrow*.6,end[1]+perp[1]*arrow*.6],[end[0]-perp[0]*arrow*.6,end[1]-perp[1]*arrow*.6]].map(p=>p.join(',')).join(' '));
-  head.setAttribute('fill','currentColor');svg.appendChild(head);
-  if(label&&label.trim()){
-   const total=path.getTotalLength(),mid=path.getPointAtLength(total/2),tag=document.createElement('div');
-   tag.className='pg-link-label';tag.textContent=label.trim();g.appendChild(tag);
-   tag.style.left=(mid.x-tag.offsetWidth/2)+'px';tag.style.top=(mid.y-tag.offsetHeight/2)+'px';
-  }
- }
- return missing;
-}
-function drawAllLinks(root=document){return Array.from(root.querySelectorAll('[data-links]')).flatMap(drawLinks);}
-// A radial diagram (one node linked to all others) reads as balanced only when the hub's mark
-// sits at the centre of the surrounding marks. Returns offsets above 6 % of the diagram size.
-function hubOffsets(slide){
- const found=[];
- for(const g of slide.querySelectorAll('[data-links]')){
-  let links;try{links=JSON.parse(g.dataset.links||'[]');}catch{continue;}
-  const count={};for(const [a,b] of links){count[a]=(count[a]||0)+1;count[b]=(count[b]||0)+1;}
-  const ids=Object.keys(count),hub=ids.find(i=>count[i]===links.length&&links.length>=3);
-  if(!hub)continue;
-  const mark=id=>{const n=g.querySelector(`[data-node="${CSS.escape(id)}"]`);if(!n)return null;
-   const icon=n.querySelector('[data-anchor]')||n.querySelector('svg[data-icon]')?.parentElement||n;const r=icon.getBoundingClientRect();return[(r.left+r.right)/2,(r.top+r.bottom)/2];};
-  const centre=mark(hub),others=ids.filter(i=>i!==hub).map(mark).filter(Boolean);
-  if(!centre||others.length<3)continue;
-  const cx=others.reduce((s,p)=>s+p[0],0)/others.length,cy=others.reduce((s,p)=>s+p[1],0)/others.length,box=g.getBoundingClientRect();
-  const dx=(centre[0]-cx)/box.width,dy=(centre[1]-cy)/box.height;
-  if(Math.hypot(dx,dy)>.06)found.push({node:hub,dx:Math.round(centre[0]-cx),dy:Math.round(centre[1]-cy)});
- }
- return found;
-}
 // Collisions the model cannot see without a render: text over text, text panels overlapping
 // each other, connectors that leave one node and end in empty space.
 function overlapArea(a,b){return Math.max(0,Math.min(a.right,b.right)-Math.max(a.left,b.left))*Math.max(0,Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top));}
@@ -622,7 +534,7 @@ async function collectSlides(options={}){
   for(const slide of slides)slide.style.cssText+=`;display:${slideDisplay}!important;width:${W}px!important;height:${H}px!important;transform:none!important;flex-shrink:0!important;`;
   const results=[];
   for(const slide of slides){
-   const fit=fitWords(slide,minFont),missingNodes=drawAllLinks(slide),collisions=measureCollisions(slide),hub=hubOffsets(slide);
+   const fit=fitWords(slide,minFont),collisions=measureCollisions(slide);
    const root=slide.getBoundingClientRect(),objects=[];
    const bg=getComputedStyle(slide).backgroundImage;
    const raster=bg.match(/^url\(["']?(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)["']?\)$/);
@@ -648,7 +560,7 @@ async function collectSlides(options={}){
     for(const node of children){if(node.nodeType===3)objects.push(...textObjects(node,root));else if(node.nodeType===1)walk(node,childClips);}
    }
    walk(slide);
-   results.push({background:visibleBackground(slide),objects,fit,collisions,missingNodes,hub,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
+   results.push({background:visibleBackground(slide),objects,fit,collisions,composition:measureComposition(slide,root),layout:measureLayout(slide,objects,results.length+1)});
   }
   return results;
  }finally{for(const [el,style] of saved){if(style===null)el.removeAttribute('style');else el.setAttribute('style',style);}}
@@ -657,12 +569,6 @@ function download(data,name,type){const blob=new Blob([data],{type}),a=document.
 globalThis.PowerGuidePptx={buildPptx,collectSlides,zipStore,shapeXML,textXML,pictureXML,clipPoints,color,coverCrop,roundedPoints,intersectPolygon,clipObjects};
 if(typeof document!=='undefined'){
  normalizeFonts();
- // Viewing the HTML: draw links once fonts are in, and again whenever a diagram changes size
- // (a slide shown after being hidden).
- document.fonts.ready.then(()=>{
-  drawAllLinks();
-  if(globalThis.ResizeObserver){const seen=new WeakMap();const ro=new ResizeObserver(entries=>{for(const en of entries){const k=Math.round(en.contentRect.width)+'x'+Math.round(en.contentRect.height);if(seen.get(en.target)!==k){seen.set(en.target,k);drawLinks(en.target);}}});document.querySelectorAll('[data-links]').forEach(g=>ro.observe(g));}
- });
  const button=document.createElement('button');button.textContent='Скачать редактируемый PPTX';button.style.cssText='position:fixed;top:16px;right:20px;z-index:10000;border:0;border-radius:8px;background:#0E5FC4;color:white;padding:14px 22px;font:600 16px Arial;cursor:pointer;box-shadow:0 3px 12px #0002';
  button.id='export-editable-pptx';document.body.appendChild(button);
  const printStyle=document.createElement('style');printStyle.textContent='@media print{#export-editable-pptx{display:none!important}}';document.head.appendChild(printStyle);

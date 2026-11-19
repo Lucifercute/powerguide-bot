@@ -40,27 +40,17 @@ def slide_contract(spec, user_slide=False) -> str:
            'icons': {n.id: n.icon for n in spec.nodes if n.icon.strip()},
            'illustration': spec.illustration or None,
            'required_user_image': f'<img data-user-slide="{spec.number}" ...>' if user_slide else None,
-           'illustration_img': f'<img data-asset-id="slide-{spec.number}-image" ...>' if spec.illustration.strip() else None,
-           'links_by_code': [f'{e.source} → {e.target}' + (f' ({e.label})' if e.label.strip() else '')
-                             for e in spec.edges] if code_links(spec) else None}
-    links = (' Связи из links_by_code рисует код: у каждого их узла — data-node="ID", свои линии и стрелки не рисуй.'
-             if code_links(spec) else '')
+           'illustration_img': f'<img data-asset-id="slide-{spec.number}-image" ...>' if spec.illustration.strip() else None}
     return ('\nTARGET_SLIDE\n' + json.dumps(row, ensure_ascii=False)
             + '\nСверстай только этот слайд. В data-visual-type и data-infographic — visual_type, НЕ код формы. '
-            'Каждая иконка из icons — <svg data-icon="ID узла" viewBox="0 0 24 24">.' + links
-            + ' Сохраняй все эти требования при исправлении любой ошибки.')
+            'Каждая иконка из icons — <svg data-icon="ID узла" viewBox="0 0 24 24">. '
+            'Сохраняй все эти требования при исправлении любой ошибки.')
 
 
 MAX_ILLUSTRATIONS = 3
 ICON_SVG = './/*[local-name()="svg"][@data-icon=$id]'
 HAND_LINES = ('.//*[@data-connector]|.//*[local-name()="line" or local-name()="path" or local-name()="polyline"]'
               '[not(ancestor::*[@data-icon])]')
-
-
-def code_links(spec) -> bool:
-    """Diagrams whose links the code draws from the plan's edges (flow keeps hand-drawn
-    variable-width streams; a timeline draws its own axis)."""
-    return spec.visual_type in {'process', 'network'} and spec.form != 'flow' and bool(spec.edges)
 
 
 def validate_plan(plan: VisualPlan, count: int) -> None:
@@ -129,16 +119,7 @@ def slide_issues(section, spec, user_slide=False, asset_id=None) -> list[str]:
     if len(graphs) != 1:
         return errors + [f'Слайд {n}: нужен один контейнер data-infographic="{spec.visual_type}".']
     g = graphs[0]
-    if code_links(spec):
-        ends = list(dict.fromkeys(i for e in spec.edges for i in (e.source, e.target)))
-        absent = [i for i in ends if len(g.xpath('.//*[@data-node=$id]', id=i)) != 1]
-        if absent:
-            errors.append(f'Слайд {n}: нужен ровно один элемент data-node="ID" для каждого узла связей: '
-                          f'{", ".join(absent)} (ID — из nodes плана).')
-        if g.xpath(HAND_LINES):
-            errors.append(f'Слайд {n}: связи схемы рисует код по edges плана — убери свои line/path/polyline '
-                          'и data-connector из data-infographic (иконки не трогай).')
-    elif spec.visual_type in {'process', 'network', 'timeline', 'stack_map'}:
+    if spec.visual_type in {'process', 'network', 'timeline', 'stack_map'}:
         if len(g.xpath('.//*[@data-node]')) < 2:
             errors.append(f'Слайд {n}: у схемы нужны минимум два элемента data-node.')
         if spec.visual_type != 'stack_map' and not g.xpath(HAND_LINES):
@@ -232,11 +213,7 @@ def assemble(plan: VisualPlan, markups: dict, style_description: str = '') -> De
             # The slide frame belongs to the code: a slide rule may not move or resize the section itself
             # (an absolute, inset section shifts the HTML view and its render away from the PPTX).
             '#presentation-viewport section.slide{position:relative!important;inset:auto!important;'
-            'margin:0!important;transform:none!important;overflow:hidden}'
-            # Link labels placed by the code; a slide may restyle them with & .pg-link-label.
-            '#presentation-viewport .pg-link-label{position:absolute;z-index:1;white-space:nowrap;margin:0;'
-            'padding:4px 12px;border-radius:999px;font-size:20px;font-weight:600;line-height:1.2;'
-            'background:var(--surface,#fff);color:var(--link-color,currentColor)}')
+            'margin:0!important;transform:none!important;overflow:hidden}')
     css = '\n'.join([*dict.fromkeys(roots), base, *rules])
     document = (f'<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>{escape(plan.title)}</title>'
                 f'<style>{css}</style></head><body><div id="presentation-viewport">'
@@ -269,9 +246,6 @@ def package(deck, plan, assets, user_images, background, width, height, session_
         section = doc.xpath('//section[@data-slide=$number]', number=str(spec.number))[0]
         if spec.form:
             section.set('data-form', spec.form)
-        if code_links(spec):
-            section.xpath('.//*[@data-infographic]')[0].set(
-                'data-links', json.dumps([[e.source, e.target, e.label] for e in spec.edges], ensure_ascii=False))
     for spec in deck.images:
         el = doc.xpath('//img[@data-asset-id=$id]', id=spec.id)[0]
         el.set('src', uri(*assets[spec.id]))

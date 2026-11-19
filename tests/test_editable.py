@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from PIL import Image as PILImage
-from lxml import html as html_parser
 
 from bot import generation_modes as modes
 from bot.db import Database
@@ -39,7 +38,8 @@ def fixtures(width=1600, height=900):
         <img data-asset-id="cover" style="width:160px;height:160px;object-fit:contain"></section>
         <section class="slide" data-slide="2" data-visual-type="process"><h1>Процесс</h1>
         <div data-infographic="process"><div data-node="a" class="node" style="left:100px">Вход</div>
-        <div data-node="b" class="node" style="left:600px">Выход</div></div>
+        <div data-node="b" class="node" style="left:600px">Выход</div>
+        <div data-connector="a-b" style="position:absolute;left:220px;top:275px;width:380px;height:2px;background:blue"></div></div>
         <img data-user-slide="2" style="position:absolute;left:80px;top:400px;width:300px;height:200px;object-fit:contain">
         </section></div></body></html>'''})
     return plan, deck
@@ -185,7 +185,7 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
                              image_prompt='Conceptual illustration', image_alt='Иллюстрация')
         slide2 = SlideMarkup(css='.node{border:2px solid blue}', html='<section class="slide" data-slide="2" data-visual-type="process">'
                              '<h1>Процесс</h1><div data-infographic="process"><div data-node="a" class="node">Вход</div>'
-                             '<div data-node="b" class="node">Выход</div></div>'
+                             '<div data-node="b" class="node">Выход</div><div data-connector="a-b"></div></div>'
                              '<img data-user-slide="2" style="width:300px;height:200px;object-fit:contain"></section>')
         answers = [(plan.model_dump_json(), 'fake'), (slide1.model_dump_json(), 'fake'), (slide2.model_dump_json(), 'fake'),
                    (slide2.model_dump_json(), 'fake')]
@@ -223,7 +223,7 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
                               image_prompt='Conceptual illustration', image_alt='Иллюстрация'),
                   SlideMarkup(css='.node{border:2px solid blue}', html='<section class="slide" data-slide="2" data-visual-type="process">'
                               '<h1>Процесс</h1><div data-infographic="process"><div data-node="a" class="node">Вход</div>'
-                              '<div data-node="b" class="node">Выход</div></div>'
+                              '<div data-node="b" class="node">Выход</div><div data-connector="a-b"></div></div>'
                               '<img data-user-slide="2" style="width:300px;height:200px;object-fit:contain"></section>')]
         answers = [(plan.model_dump_json(), 'fake')] + [(s.model_dump_json(), 'fake') for s in slides]
         llm = SimpleNamespace(generate=AsyncMock(side_effect=answers))
@@ -264,9 +264,7 @@ class MarkupTests(unittest.TestCase):
         for old, new in [('</body>', '<script>fetch("https://example.com")</script></body>'),
                          ('data-asset-id="cover"','data-asset-id="cover" src="file:///etc/passwd"'),
                          ('data-user-slide="2"','data-user-slide="3"'),
-                         # links are drawn by the code: a missing node or a hand-drawn connector is rejected
-                         ('data-node="b"','data-node="z"'),
-                         ('Выход</div></div>','Выход</div><div data-connector="a-b"></div></div>')]:
+                         ('data-connector="a-b"','class="plain"')]:
             bad = deck.model_copy(update={'html': deck.html.replace(old,new)})
             with self.subTest(new=new), self.assertRaises(ValueError): validate_deck(bad,plan,{2})
 
@@ -275,8 +273,6 @@ class MarkupTests(unittest.TestCase):
         picture=(b'original-background-bytes','image/png')
         result=package(deck,plan,{'cover':picture},{2:picture},picture,1600,900,123)
         self.assertIn('b3JpZ2luYWwtYmFja2dyb3VuZC1ieXRlcw==',result)
-        links = html_parser.document_fromstring(result).xpath('//*[@data-links]')
-        self.assertEqual([json.loads(e.get('data-links')) for e in links], [[['a', 'b', '']]])
         self.assertIn('presentation-123-editable.pptx',result)
         self.assertIn('Content-Security-Policy',result)
 
