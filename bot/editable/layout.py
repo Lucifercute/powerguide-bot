@@ -2,7 +2,7 @@
 import json
 
 # Smallest readable size on a 1600 px wide slide (scaled for other canvases).
-MIN_FONT_PX = 18
+MIN_FONT_PX = 20
 EXEMPT = {'cover', 'closing'}
 
 
