@@ -4,6 +4,7 @@ uv run python scripts/run_miniapp.py
 uv run python scripts/run_miniapp.py --telegram --with-bot
 """
 import argparse
+import errno
 import os
 from pathlib import Path
 import secrets
@@ -41,8 +42,10 @@ def main():
     with socket.socket() as probe:
         try:
             probe.bind(('127.0.0.1', args.port))
-        except OSError:
-            parser.error(f'Порт {args.port} занят. Остановите предыдущий процесс или укажите --port')
+        except OSError as error:
+            if error.errno == errno.EADDRINUSE:
+                parser.error(f'Порт {args.port} занят. Остановите предыдущий процесс или укажите --port')
+            parser.error(f'Не удалось открыть 127.0.0.1:{args.port}: {error.strerror}')
     commands = [[sys.executable,'-m','uvicorn','bot.web.api:create_app','--factory','--host','127.0.0.1',
                  '--port',str(args.port),'--no-access-log','--no-proxy-headers']]
     if not args.no_worker:
