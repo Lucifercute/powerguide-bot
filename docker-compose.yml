@@ -1,20 +1,70 @@
+# bot (Telegram chat), api (Mini App + its interface), worker (generation queue) share one image,
+# the database and session files in data/. Caddy is the only public entry: HTTPS for the Mini App.
+x-app: &app
+  build: .
+  image: powerguide-bot
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    # Chat and Mini App share the job queue only in pilot mode.
+    PILOT_ENABLED: "1"
+  # Same uid as the host user (opc), so files in data/ stay editable from the host.
+  user: "1000:1000"
+  volumes:
+    # :z labels the folders for SELinux (Enforcing on the server).
+    - ./data:/app/data:z
+    - ./prompts:/app/prompts:ro,z
+    - ./presets:/app/presets:ro,z
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
 services:
   bot:
-    build: .
+    <<: *app
     container_name: powerguide-bot
-    restart: unless-stopped
-    env_file: .env
-    # Same uid as the host user (opc), so files in data/ stay editable from the host.
-    user: "1000:1000"
-    volumes:
-      # :z labels the folders for SELinux (Enforcing on the server).
-      - ./data:/app/data:z
-      - ./prompts:/app/prompts:ro,z
-      - ./presets:/app/presets:ro,z
-    # A runaway bot gets restarted instead of starving schedule-bot on the same server.
     mem_limit: 1g
+
+  worker:
+    <<: *app
+    container_name: powerguide-worker
+    command: ["/app/.venv/bin/python", "-m", "bot.web.worker"]
+    # Chromium and LibreOffice run here.
+    mem_limit: 2g
+
+  api:
+    <<: *app
+    container_name: powerguide-api
+    # Not published: only Caddy reaches it. Forwarded headers come from Caddy alone.
+    command: ["/app/.venv/bin/uvicorn", "bot.web.api:create_app", "--factory", "--host", "0.0.0.0",
+              "--port", "8000", "--no-access-log", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    mem_limit: 512m
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    container_name: powerguide-caddy
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # Domain from .env; Caddy gets and renews the Let's Encrypt certificate itself.
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 256m
     logging:
       driver: json-file
       options:
         max-size: 10m
         max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -9,3 +9,8 @@ prompts
 presets
 snapshots
 scripts
+frontend/node_modules
+frontend/dist
+frontend/test-results
+frontend/tsconfig.tsbuildinfo
+.DS_Store

@@ -1,0 +1,6 @@
+# Public entry for the Mini App. SITE_ADDRESS is a domain (from .env): Caddy turns on HTTPS
+# with a Let's Encrypt certificate and redirects HTTP to HTTPS. The API serves the interface too.
+{$SITE_ADDRESS} {
+	encode zstd gzip
+	reverse_proxy api:8000
+}
