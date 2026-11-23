@@ -1,6 +1,7 @@
 """Replay an approved local session through the bot's real API pipeline in isolation.
 
 Usage: .venv/bin/python -m scripts.test_editable_session --session 37 --output snapshots/example
+--preset N swaps the style for prepared preset N (same as choosing it in the Mini App).
 Existing output resumes saved stages; use a new output directory for a fresh experiment.
 No Telegram delivery, production DB writes or hand-authored model output.
 """
@@ -21,6 +22,7 @@ from bot.db import Database
 from bot.editable.browser import render
 from bot.editable.service import EditableService, sha, write
 from bot.llm import TextLLM, ImageLLM
+from bot.presets import PresetStore
 from bot.pipeline import PLAN, TZ, DATA, STYLE, STYLE_PRESET, BACKGROUND, BACKGROUND_ALT, BACKGROUND_CHOICE, BACKGROUND_ACCEPTED
 
 
@@ -32,7 +34,14 @@ async def main(args):
     allowed={PLAN.kind,TZ.kind,DATA.kind,STYLE,STYLE_PRESET,BACKGROUND,BACKGROUND_ALT,BACKGROUND_CHOICE,BACKGROUND_ACCEPTED}
     artifacts=[row for row in artifacts if row[0] in allowed or row[0].startswith('user_image_')]
     if not any(row[0]==PLAN.kind for row in artifacts):raise ValueError('Approved source plan not found')
-    manifest={'source_session':args.session,'source_db':str(config.db_path.resolve()),
+    if args.preset is not None:
+        # Same artifacts as choosing the preset in the Mini App; content (plan, data, TZ) stays the same.
+        preset=PresetStore(config.presets_dir).get(args.preset)
+        if not preset:raise ValueError(f'Preset {args.preset} not found')
+        replaced={STYLE_PRESET:str(preset.number),STYLE:preset.style,BACKGROUND:str(preset.background),BACKGROUND_ACCEPTED:''}
+        artifacts=[row for row in artifacts if row[0] not in replaced and row[0] not in (BACKGROUND_ALT,BACKGROUND_CHOICE)]
+        artifacts+=[(kind,content,'preset') for kind,content in replaced.items()]
+    manifest={'source_session':args.session,'source_db':str(config.db_path.resolve()),'preset':args.preset,
               'artifacts_sha256':sha(json.dumps(artifacts,ensure_ascii=False)),
               'answers_sha256':sha(json.dumps(answers,ensure_ascii=False))}
     mp=out/'source-manifest.json'
@@ -88,6 +97,7 @@ async def main(args):
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--session',type=int,required=True)
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--audit-baseline',action='store_true')
+    parser.add_argument('--preset',type=int,help='Replace the session style with a prepared preset (its passport and background)')
     args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('google_genai.models').setLevel(logging.WARNING)
