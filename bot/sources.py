@@ -47,6 +47,8 @@ class SourceFile:
     path: Path
     mime_type: str
     text: str | None  # extracted text; None = the model reads the file itself
+    position: int = 0
+    comment: str = ""
 
 
 class UnreadableFile(Exception):

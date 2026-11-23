@@ -1,8 +1,8 @@
 export type Summary = { id: number; title: string; status: string; origin: string; created_at: string };
 export type Project = Summary & {
-  revision: number; stage: string; description: string; note: string;
+  revision: number; stage: string; description: string;
   answers: Record<string, string>; questions: { key: string; text: string }[];
-  sources: { name: string }[]; notes: string[];
+  sources: { position: number; name: string; comment: string }[]; sources_confirmed: boolean; notes: string[];
   slides: { number: number; text: string; missing: string[]; image: string | null; caption: string | null }[];
   job: { id: number; action: string; status: string; progress: string; error: string | null } | null;
   busy: boolean; actions: string[]; backgrounds: { choice: string; url: string }[];

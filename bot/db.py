@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS source_files (
     path        TEXT    NOT NULL,
     mime_type   TEXT    NOT NULL,
     text        TEXT,              -- extracted text; NULL = the model reads the file itself
+    comment     TEXT    NOT NULL DEFAULT '',
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (session_id, position)
 );
@@ -103,6 +104,10 @@ class Database:
             columns = {row["name"] for row in await cur.fetchall()}
         if "waiting_for" not in columns:
             await self.conn.execute("ALTER TABLE sessions ADD COLUMN waiting_for TEXT")
+        async with self.conn.execute("PRAGMA table_info(source_files)") as cur:
+            columns = {row["name"] for row in await cur.fetchall()}
+        if "comment" not in columns:
+            await self.conn.execute("ALTER TABLE source_files ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
 
     async def close(self) -> None:
         if self._conn:
@@ -194,19 +199,35 @@ class Database:
 
     async def add_source_file(self, session_id: int, file: SourceFile) -> None:
         await self.conn.execute(
-            "INSERT INTO source_files (session_id, position, name, path, mime_type, text) "
-            "VALUES (?, (SELECT COUNT(*) + 1 FROM source_files WHERE session_id = ?), ?, ?, ?, ?)",
-            (session_id, session_id, file.name, str(file.path), file.mime_type, file.text),
+            "INSERT INTO source_files (session_id, position, name, path, mime_type, text, comment) "
+            "VALUES (?, (SELECT COALESCE(MAX(position), 0) + 1 FROM source_files WHERE session_id = ?), ?, ?, ?, ?, ?)",
+            (session_id, session_id, file.name, str(file.path), file.mime_type, file.text, file.comment),
         )
         await self.commit()
 
     async def get_source_files(self, session_id: int) -> list[SourceFile]:
         async with self.conn.execute(
-            "SELECT name, path, mime_type, text FROM source_files WHERE session_id = ? ORDER BY position",
+            "SELECT position, name, path, mime_type, text, comment FROM source_files WHERE session_id = ? ORDER BY position",
             (session_id,),
         ) as cur:
             rows = await cur.fetchall()
-        return [SourceFile(r["name"], Path(r["path"]), r["mime_type"], r["text"]) for r in rows]
+        return [
+            SourceFile(r["name"], Path(r["path"]), r["mime_type"], r["text"], r["position"], r["comment"])
+            for r in rows
+        ]
+
+    async def save_source_comments(self, session_id: int, comments: dict[int, str]) -> None:
+        await self.conn.executemany(
+            "UPDATE source_files SET comment = ? WHERE session_id = ? AND position = ?",
+            [(comment.strip(), session_id, position) for position, comment in comments.items()],
+        )
+        await self.commit()
+
+    async def delete_source_file(self, session_id: int, position: int) -> None:
+        await self.conn.execute(
+            "DELETE FROM source_files WHERE session_id = ? AND position = ?", (session_id, position)
+        )
+        await self.commit()
 
     async def delete_source_files(self, session_id: int) -> None:
         await self.conn.execute("DELETE FROM source_files WHERE session_id = ?", (session_id,))

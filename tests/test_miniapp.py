@@ -17,7 +17,7 @@ from PIL import Image as PILImage
 
 from bot.db import Database
 from bot.llm import Image
-from bot.pipeline import BackgroundFields, PLAN
+from bot.pipeline import BackgroundFields, Pipeline, PLAN
 from bot.questions import QuestionBank
 from bot.web.api import create_app
 from bot.web.auth import telegram_user, issue_session
@@ -129,6 +129,60 @@ class MiniAppTests(unittest.IsolatedAsyncioTestCase):
         image = await self.client.get(p['backgrounds'][0]['url'])
         self.assertEqual(image.status_code,200)
         return await self.command(p,'accept_background')
+
+    async def test_source_comments_reach_analysis_with_the_correct_files(self):
+        p = await self.create()
+        for contents in (b'First document', b'Second document'):
+            response = await self.client.post(
+                f'/api/v1/projects/{p["id"]}/uploads',
+                params={'kind': 'source', 'revision': p['revision']},
+                files={'file': ('data.txt', contents, 'text/plain')},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            p = response.json()
+
+        p = await self.command(p, 'save_sources', description='Presentation', note='General instructions')
+        p = await self.command(p, 'analyze', description='Presentation', sources_confirmed=True, source_comments={1: 'Use section 1', 2: 'Check section 2'})
+        await self.work()
+        analysis_args = self.pipeline.analyze_survey.await_args.args
+        self.assertEqual(analysis_args[2], 'General instructions')
+        parts = await Pipeline._file_parts(SimpleNamespace(llm=SimpleNamespace(can_upload=False)), analysis_args[3])
+        self.assertIn('Use section 1', parts[1])
+        self.assertIn('First document', parts[1])
+        self.assertIn('Check section 2', parts[2])
+        self.assertIn('Second document', parts[2])
+
+    async def test_delete_sources_preserves_other_comments_and_frees_upload_slot(self):
+        p = await self.create()
+
+        async def upload(project, content):
+            response = await self.client.post(
+                f'/api/v1/projects/{project["id"]}/uploads',
+                params={'kind': 'source', 'revision': project['revision']},
+                files={'file': ('same.txt', content, 'text/plain')},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        p = await upload(p, b'First')
+        p = await upload(p, b'Second')
+        first, second = await self.db.get_source_files(p['id'])
+        p = await self.command(p, 'delete_source', source_position=first.position)
+        self.assertFalse(first.path.exists())
+        self.assertFalse(p['sources_confirmed'])
+        p = await upload(p, b'Third')
+        third = p['sources'][-1]['position']
+        self.assertNotEqual(third, second.position)
+        p = await self.command(p, 'save_sources', description='Presentation', sources_confirmed=True,
+                               source_comments={second.position: 'Keep this comment'})
+        p = await self.command(p, 'delete_source', source_position=third)
+        self.assertTrue(p['sources_confirmed'])
+        self.assertEqual(p['sources'], [{'position': second.position, 'name': 'same.txt',
+                                         'comment': 'Keep this comment'}])
+        self.assertTrue(second.path.exists())
+        p = await self.command(p, 'delete_source', source_position=second.position)
+        self.assertEqual(p['sources'], [])
+        self.assertFalse(second.path.exists())
 
     async def test_complete_standard_pipeline_and_history_downloads(self):
         p = await self.to_mode()

@@ -177,6 +177,7 @@ def build_prompt(
     artifacts: dict[str, str],
     files: list[types.Part | str] | None = None,
     file_names: list[str] = (),
+    file_comments: list[str] = (),
 ) -> types.ContentListUnion:
     """Prompt for the step. For DATA, `files` are the customer's files ready for the model
     (see Pipeline._file_parts); the result is then a list of text and file parts.
@@ -185,9 +186,12 @@ def build_prompt(
     if step is TZ:
         description = artifacts.get(DESCRIPTION)
         about = f"Описание презентации моими словами:\n\n{description}\n\n" if description else ""
+        customer_data = format_customer_data(list(file_names), note)
+        if file_comments:
+            customer_data += "\n\nКомментарии к отдельным файлам:\n" + "\n".join(file_comments)
         return (
             f"{template}\n\n{about}"
-            f"Исходные данные:\n\n{format_customer_data(list(file_names), note)}\n\n"
+            f"Исходные данные:\n\n{customer_data}\n\n"
             f"Мои ответы на вопросы:\n\n{format_answers(survey, answers)}"
         )
     if step is DATA:
@@ -340,7 +344,11 @@ class Pipeline:
         """Return (result, model). Raises LLMError if every model failed."""
         files = await self._file_parts(sources) if step is DATA else None
         template = load_prompt(self.prompts_dir, step.prompt)
-        prompt = build_prompt(step, template, survey, answers, artifacts, files, [f.name for f in sources])
+        file_comments = [
+            f"Файл №{i} «{file.name}»: {file.comment}"
+            for i, file in enumerate(sources, start=1) if file.comment
+        ] if step is TZ else []
+        prompt = build_prompt(step, template, survey, answers, artifacts, files, [f.name for f in sources], file_comments)
         result, model = await self.llm.generate(prompt)
         if step is DATA:
             invented = _urls(result) - _urls(artifacts.get(SOURCES) or "")
@@ -411,11 +419,14 @@ class Pipeline:
         binary = [f for f in sources if f.text is None]
         upload = self.llm.can_upload and sum(f.path.stat().st_size for f in binary) > INLINE_FILES_LIMIT
         parts: list[types.Part | str] = [f"Приложено файлов: {len(sources)}. Ссылайся на них по имени файла."]
-        for file in sources:
+        for i, file in enumerate(sources, start=1):
+            caption = f"\n\nФайл №{i} «{file.name}»"
+            if file.comment:
+                caption += f"\nКомментарий заказчика к этому файлу: {file.comment}"
             if file.text is not None:
-                parts.append(f"\n\nФайл «{file.name}» (текст извлечён из файла):\n\n{file.text}")
+                parts.append(f"{caption}\nИзвлечённый текст файла:\n\n{file.text}")
                 continue
-            parts.append(f"\n\nФайл «{file.name}»:")
+            parts.append(caption)
             if upload:
                 parts.append(await self.llm.upload(file.path, file.mime_type))
             else:

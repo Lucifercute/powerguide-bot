@@ -176,7 +176,7 @@ function App() {
             <fieldset className="workspace" disabled={working || project.busy}>
               {project.origin === 'chat' && project.status === 'in_progress' ? <section className="card empty"><h2>Продолжите в чате бота</h2><p>Эта презентация начата в Telegram-чате. Здесь появятся её готовые результаты.</p><button className="secondary" onClick={() => void create()}>Создать новую в приложении</button></section> : <>
                 {project.stage === 'sources' && <Sources key={project.id} project={project} command={command} upload={upload}/>}
-                {project.stage === 'survey' && <Survey key={project.id+':survey'} project={project} command={command}/>}
+                {project.stage === 'survey' && <Survey key={project.id+':survey'} project={project} command={command} maxSlides={config?.max_slides ?? 10}/>}
                 {project.stage === 'plan' && <Plan project={project} command={command} upload={upload}/>}
                 {project.stage === 'style' && <section className="card form-card"><span className="eyebrow">ШАГ 4 / ДИЗАЙН</span><h2>Выберите настроение</h2><p>Готовый стиль задаст оформление всех слайдов. Или загрузите свой референс.</p>
                   <div className="preset-grid">{presets.map(p => <button key={p.number} className="preset" onClick={() => void command('select_style',{preset:p.number})}><img src={p.preview} alt={`Пример оформления стиля ${p.number}`}/><span>Стиль {p.number} →</span></button>)}</div>
@@ -213,22 +213,154 @@ type Upload = { upload: (kind: string, files: FileList | null, number?: number, 
 
 function Sources({project,command,upload}: Props & Upload) {
   const [description,setDescription] = useState(project.description);
-  const [note,setNote] = useState(project.note);
   const [ratio,setRatio] = useState(project.answers['design.ratio'] || '16:9');
-  const values = {description,note,ratio};
+  const sourceList = project.sources.map(file => file.position).join(',');
+  const [confirmedList, setConfirmedList] = useState(project.sources_confirmed ? sourceList : null);
+  const [comments, setComments] = useState<Record<number, string>>({});
+  const confirmed = confirmedList === sourceList;
+  const analyzeDisabled = !description.trim() || (!!sourceList && !confirmed);
+  const values = {
+    description, ratio, sources_confirmed: confirmed,
+    source_comments: Object.fromEntries(project.sources
+      .filter(file => comments[file.position] !== undefined)
+      .map(file => [file.position, comments[file.position]])),
+  };
+  const removeSource = async (position: number) => {
+    const result = await command('delete_source', {source_position: position});
+    if (!result.project) return;
+    setComments(current => {
+      const next = {...current};
+      delete next[position];
+      return next;
+    });
+    setConfirmedList(confirmed ? result.project.sources.map(file => file.position).join(',') : null);
+  };
+  const removeButton = (file: Project['sources'][number]) => (
+    <button type="button" className="text-button danger remove-source"
+      aria-label={`Удалить файл ${file.position} — ${file.name}`}
+      onClick={() => void removeSource(file.position)}>Удалить</button>
+  );
   return <section className="card form-card"><span className="eyebrow">ШАГ 1 / ИСХОДНЫЕ МАТЕРИАЛЫ</span><h2>О чём расскажем?</h2><p>Опишите идею своими словами. Можно без готового плана — разберёмся вместе.</p>
     <label>Описание презентации <span className="required">*</span><textarea value={description} maxLength={20000} onChange={e=>setDescription(e.target.value)} placeholder="Например: презентация новой услуги для руководителей малого бизнеса. Нужно объяснить пользу и пригласить на консультацию…" rows={5}/></label>
     <label>Формат слайдов<select value={ratio} onChange={e=>setRatio(e.target.value)}><option value="16:9">16:9 — широкоформатный</option><option value="4:3">4:3 — классический</option></select></label>
     <label className="upload-box">＋ Добавить исходные файлы<small>PDF, Word, Excel, PowerPoint, TXT, CSV и изображения<br/>До 10 файлов, каждый до 20 МБ</small><input type="file" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.xlsx,.txt,.csv,.jpg,.jpeg,.png,.webp" onChange={e=>{void upload('source',e.currentTarget.files);e.currentTarget.value='';}}/></label>
-    {!!project.sources.length && <ul className="file-list">{project.sources.map((f,i)=><li key={i}><span>▤</span>{f.name}<span className="success-text">✓</span></li>)}</ul>}
-    <label>Что ещё нужно учесть?<textarea value={note} maxLength={20000} onChange={e=>setNote(e.target.value)} rows={3} placeholder="Факты, пожелания или комментарий к файлам"/></label>
+    {!!project.sources.length && (confirmed ? (
+      <table className="source-comments" aria-label="Комментарии к исходным файлам">
+        <caption>Укажите, что использовать из каждого файла. Комментарии необязательны.</caption>
+        <colgroup><col className="source-name-column"/><col/></colgroup>
+        <thead><tr><th scope="col">Файл</th><th scope="col">Комментарий</th></tr></thead>
+        <tbody>{project.sources.map(file => (
+          <tr key={file.position}>
+            <th scope="row">{file.name}{removeButton(file)}</th>
+            <td><textarea aria-label={`Комментарий к файлу ${file.position} — ${file.name}`}
+              value={comments[file.position] ?? file.comment} rows={2} maxLength={2000}
+              placeholder="Например, используйте данные из таблицы 2"
+              onChange={e => setComments({...comments, [file.position]: e.target.value})}/></td>
+          </tr>
+        ))}</tbody>
+      </table>
+    ) : (
+      <div className="source-confirmation">
+        <ul className="file-list">{project.sources.map(file => <li key={file.position}><span aria-hidden="true">▤</span><span className="source-file-name">{file.name}</span>{removeButton(file)}</li>)}</ul>
+        <button type="button" className="secondary" onClick={() => setConfirmedList(sourceList)}>Готово, все файлы добавлены</button>
+      </div>
+    ))}
     <p className="hint">Ссылки на документы пока не читаются. Прикрепите сами файлы.</p>
-    <div className="form-actions"><button className="secondary" disabled={!description.trim()} onClick={()=>void command('save_sources',values)}>Сохранить черновик</button><button className="primary" disabled={!description.trim()} onClick={()=>void command('analyze',values)}>Изучить материалы →</button></div>
+    <div className="form-actions"><button className="secondary" disabled={!description.trim()} onClick={()=>void command('save_sources',values)}>Сохранить черновик</button><button className="primary" disabled={analyzeDisabled} onClick={()=>void command('analyze',values)}>Изучить материалы →</button></div>
   </section>;
 }
-function Survey({project,command}: Props) {
-  const [answers,setAnswers] = useState<Record<string,string>>(() => Object.fromEntries(project.questions.map(q => [q.key, project.answers[q.key] || ''])));
-  return <section className="card form-card"><span className="eyebrow">ШАГ 2 / УТОЧНЕНИЯ</span><h2>Проверим, что всё поняли</h2><p>Мы нашли часть ответов в ваших материалах. Дополните или исправьте их. Поля можно оставить пустыми.</p><div className="survey-grid">{project.questions.map(q=><label key={q.key}>{q.text}<textarea value={answers[q.key] === 'Не указано' ? '' : answers[q.key] || ''} maxLength={10000} rows={3} onChange={e=>setAnswers({...answers,[q.key]:e.target.value})}/></label>)}</div><div className="form-actions"><button className="primary" onClick={()=>void command('confirm_survey',{answers})}>Подтвердить и подготовить план →</button></div></section>;
+const usageKey = 'audience.usage';
+const otherUsage = 'другое';
+
+function surveyChoices(maxSlides: number): Record<string, {label?: string; options: string[]}> {
+  return {
+    [usageKey]: {label: 'Как будет использоваться презентация?', options: ['выступление', 'рассылка', 'все вместе', otherUsage]},
+    'audience.viewers': {options: ['1', 'до 5', 'до 20', 'до 100', 'больше 100', 'не знаю']},
+    'audience.volume': {label: 'Сколько слайдов?', options: Array.from({length: maxSlides}, (_, i) => String(i + 1))},
+    'source.task': {label: 'Что нужно сделать?', options: ['Разработать презентацию с нуля', 'Переработать существующую презентацию']},
+    'source.research': {options: ['да', 'нет']},
+  };
+}
+
+function normalizeSurveyChoice(key: string, answer: string, options: string[]): string {
+  const normalize = (value: string) => value.trim().toLowerCase().replaceAll('ё', 'е').replace(/[.!?]+$/, '');
+  const value = normalize(answer);
+  const exact = options.find(option => normalize(option) === value);
+  if (exact) return exact;
+  if (!value || value === 'не указано') return '';
+
+  if (key === usageKey) {
+    const speaking = /выступлен/.test(value);
+    const mailing = /рассылк/.test(value);
+    if (speaking && mailing && /(?:выступлен\S*\s+и\s+рассылк|рассылк\S*\s+и\s+выступлен)/.test(value)) return 'все вместе';
+    if (/^(?:для )?выступлен(?:ие|ия)$/.test(value)) return 'выступление';
+    if (/^(?:для )?рассылк[аиу]$/.test(value)) return 'рассылка';
+    return otherUsage;
+  }
+  if (key === 'audience.viewers') {
+    if (/^(?:неизвестно|пока не знаю)$/.test(value)) return 'не знаю';
+    const match = value.match(/^(\d+)\s*(?:человек[аи]?|зрител(?:ь|я|ей))?$/);
+    if (match && Number(match[1]) >= 1) {
+      const count = Number(match[1]);
+      if (count === 1) return '1';
+      return [5, 20, 100].map(limit => ({limit, label: `до ${limit}`}))
+        .find(option => count <= option.limit)?.label ?? 'больше 100';
+    }
+  }
+  if (key === 'audience.volume') {
+    const count = value.match(/^(\d+)\s+слайд(?:а|ов)?$/)?.[1];
+    if (count && options.includes(count)) return count;
+  }
+  if (key === 'source.task') {
+    if (/^(?:создать |разработать )?(?:презентацию )?с нуля$/.test(value)) return options[0];
+    if (/^(?:переработать|оптимизировать)(?: (?:уже )?существующую)?(?: презентацию)?$/.test(value)) return options[1];
+  }
+  if (key === 'source.research') {
+    if (/^(?:не нужен|не нужно|не требуется|нет, не (?:нужен|нужно|требуется))$/.test(value)) return 'нет';
+    if (/^(?:нужен|нужно|требуется|да, (?:нужен|нужно|требуется))$/.test(value)) return 'да';
+  }
+  return '';
+}
+
+function Survey({project,command,maxSlides}: Props & {maxSlides: number}) {
+  const choices = surveyChoices(maxSlides);
+  const [answers, setAnswers] = useState<Record<string, string>>(() => Object.fromEntries(project.questions.map(question => {
+    const raw = project.answers[question.key] || '';
+    const choice = choices[question.key];
+    return [question.key, choice ? normalizeSurveyChoice(question.key, raw, choice.options) : raw === 'Не указано' ? '' : raw];
+  })));
+  const [other, setOther] = useState(() => {
+    const raw = project.answers[usageKey]?.trim() || '';
+    return answers[usageKey] === otherUsage && raw.toLowerCase() !== otherUsage ? raw : '';
+  });
+  const needsOther = answers[usageKey] === otherUsage;
+  const confirm = () => void command('confirm_survey', {
+    answers: needsOther ? {...answers, [usageKey]: other.trim()} : answers,
+  });
+  return <section className="card form-card">
+    <span className="eyebrow">ШАГ 2 / УТОЧНЕНИЯ</span><h2>Проверим, что всё поняли</h2>
+    <p>Мы нашли часть ответов в ваших материалах. Дополните или исправьте их. Поля можно оставить пустыми.</p>
+    <div className="survey-grid">{project.questions.map(question => {
+      const choice = choices[question.key];
+      const value = answers[question.key] || '';
+      const raw = project.answers[question.key]?.trim();
+      const change = (text: string) => setAnswers(current => ({...current, [question.key]: text}));
+      return <div key={question.key}>
+        <label>{choice?.label ?? question.text}{choice ?
+          <select value={value} onChange={e => change(e.target.value)}>
+            <option value="">Не выбрано</option>
+            {choice.options.map(option => <option key={option}>{option}</option>)}
+          </select> :
+          <textarea value={value} onChange={e => change(e.target.value)} maxLength={10000} rows={3}/>}
+        </label>
+        {choice && !value && raw && raw.toLowerCase() !== 'не указано' && <p className="hint survey-previous-answer">Ранее найденный ответ: {raw}</p>}
+        {question.key === usageKey && needsOther && <label>Как именно будет использоваться презентация?
+          <textarea value={other} onChange={e => setOther(e.target.value)} maxLength={10000} rows={2}/>
+        </label>}
+      </div>;
+    })}</div>
+    <div className="form-actions"><button className="primary" disabled={needsOther && !other.trim()} onClick={confirm}>Подтвердить и подготовить план →</button></div>
+  </section>;
 }
 function Plan({project,command,upload}: Props & Upload) {
   const [texts,setTexts] = useState<Record<number,string>>({});

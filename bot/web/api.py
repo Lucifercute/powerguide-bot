@@ -1,6 +1,7 @@
 """Same-origin Mini App API. No model calls are made in HTTP handlers."""
 import asyncio
 import json
+import logging
 import mimetypes
 import secrets
 import shutil
@@ -8,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -45,13 +46,20 @@ class CreateProject(BaseModel):
     replace_active: bool = False
 
 
+SOURCES_CONFIRMED = "sources_confirmed"
+log = logging.getLogger(__name__)
+
+
 class Command(BaseModel):
     revision: int
     action: Literal['save_sources', 'analyze', 'confirm_survey', 'edit_slide', 'accept_plan',
                     'select_style', 'change_background', 'accept_background', 'generate',
-                    'retry', 'cancel', 'deliver', 'delete_image']
+                    'retry', 'cancel', 'deliver', 'delete_image', 'delete_source']
     description: str = Field(default='', max_length=20000)
-    note: str = Field(default='', max_length=20000)
+    note: str | None = Field(default=None, max_length=20000)
+    source_position: int | None = Field(default=None, ge=1)
+    sources_confirmed: bool | None = None
+    source_comments: dict[int, Annotated[str, Field(max_length=2000)]] = Field(default_factory=dict, max_length=10)
     ratio: Literal['16:9', '4:3'] = '16:9'
     answers: dict[str, str] = Field(default_factory=dict, max_length=50)
     number: int = Field(default=1, ge=1, le=10)
@@ -217,7 +225,7 @@ def create_app(settings: WebSettings | None = None):
             stage = 'cancelled'
         actions = []
         if p['status'] == 'in_progress' and p['origin'] == 'miniapp' and not busy:
-            actions = {'sources': ['save_sources','analyze'], 'survey': ['confirm_survey'],
+            actions = {'sources': ['save_sources','analyze','delete_source'], 'survey': ['confirm_survey'],
                        'plan': ['edit_slide','delete_image','accept_plan'], 'style': ['select_style'],
                        'background': ['change_background','accept_background'], 'mode': ['generate']}.get(stage, [])
         if job and job['status'] in ('failed', 'interrupted'):
@@ -231,12 +239,14 @@ def create_app(settings: WebSettings | None = None):
         for n in slides:
             if a.get(slide_kind(n)):
                 previews.append({'number': n, 'url': root+f'/assets/{slide_kind(n)}'})
+        sources = await db.get_source_files(sid)
         return {
             'id': sid, 'title': p['title'] or a.get(DESCRIPTION, '')[:80] or f'Презентация {sid}',
             'origin': p['origin'], 'status': p['status'], 'stage': stage, 'revision': p['revision'],
             'created_at': p['created_at'], 'description': a.get(DESCRIPTION, ''), 'note': a.get(SOURCES_NOTE, ''),
             'answers': await db.get_answers(sid), 'questions': [{'key': q.key, 'text': q.text} for q in QuestionBank(settings.questions_path).load().questions],
-            'sources': [{'name': f.name} for f in await db.get_source_files(sid)],
+            'sources': [{'position': f.position, 'name': f.name, 'comment': f.comment} for f in sources],
+            'sources_confirmed': a.get(SOURCES_CONFIRMED) == str(len(sources)),
             'slides': [{'number': n, 'text': text, 'missing': missing.get(n, []),
                         'image': root+f'/assets/{user_image_kind(n)}' if user_image_kind(n) in a else None,
                         'caption': UserImage.from_json(a[user_image_kind(n)]).caption if user_image_kind(n) in a else ''} for n, text in slides.items()],
@@ -286,6 +296,7 @@ def create_app(settings: WebSettings | None = None):
 
     @app.post('/api/v1/projects/{sid}/commands')
     async def command(sid: int, body: Command, user=Depends(current_user), db=Depends(database)):
+        removed_path = None
         async with db.transaction():
             p = await owned(db, sid, user)
             if body.action == 'cancel':
@@ -309,12 +320,34 @@ def create_app(settings: WebSettings | None = None):
                 if action in ('save_sources','analyze') and stage == 'sources':
                     if not body.description.strip():
                         raise ValueError('Опишите, о чём будет презентация')
+                    if body.source_comments or body.sources_confirmed is not None:
+                        positions = {source.position for source in await db.get_source_files(sid)}
+                        if body.source_comments.keys() - positions:
+                            raise ValueError('Файл для комментария не найден')
+                        if body.source_comments:
+                            await db.save_source_comments(sid, body.source_comments)
+                        if body.sources_confirmed:
+                            await db.save_artifact(sid, SOURCES_CONFIRMED, str(len(positions)), 'user')
+                        elif body.sources_confirmed is False:
+                            await db.delete_artifact(sid, SOURCES_CONFIRMED)
                     await db.save_artifact(sid, DESCRIPTION, body.description.strip(), 'user')
-                    await db.save_artifact(sid, SOURCES_NOTE, body.note.strip(), 'user')
+                    if body.note is not None:
+                        await db.save_artifact(sid, SOURCES_NOTE, body.note.strip(), 'user')
                     await db.save_answer(sid, RATIO_ANSWER_KEY, 'Формат слайдов', body.ratio)
                     await update_project(db, sid, title=body.description.strip()[:80])
                     if action == 'analyze':
                         await queue('analyze')
+                elif action == 'delete_source' and stage == 'sources':
+                    sources = await db.get_source_files(sid)
+                    source = next((f for f in sources if f.position == body.source_position), None)
+                    if source is None:
+                        raise ValueError('Исходный файл не найден')
+                    await db.delete_source_file(sid, source.position)
+                    removed_path = source.path
+                    if len(sources) > 1 and a.get(SOURCES_CONFIRMED) == str(len(sources)):
+                        await db.save_artifact(sid, SOURCES_CONFIRMED, str(len(sources) - 1), 'user')
+                    else:
+                        await db.delete_artifact(sid, SOURCES_CONFIRMED)
                 elif action == 'confirm_survey' and stage == 'survey':
                     questions = QuestionBank(settings.questions_path).load().questions
                     valid = {q.key for q in questions}
@@ -371,6 +404,13 @@ def create_app(settings: WebSettings | None = None):
                 else:
                     raise Conflict('Это действие сейчас недоступно')
                 await update_project(db, sid, stage=(await project(db, sid))['stage'])
+        if removed_path is not None:
+            source_dir = settings.files_dir.resolve() / str(sid) / 'sources'
+            if removed_path.resolve().is_relative_to(source_dir):
+                try:
+                    removed_path.unlink(missing_ok=True)
+                except OSError:
+                    log.warning('Could not remove detached source file for project %s', sid, exc_info=True)
         return await view(db, await project(db, sid))
 
     @app.get('/api/v1/presets')
