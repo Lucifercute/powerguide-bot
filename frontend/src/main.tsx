@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api, ApiError, statusLabel, type Project, type Summary, type Config, type Me, type Preset } from './api';
-import { bindBack, initData, setupPlatform } from './platform';
+import { bindBack, initData, inTelegram, setupPlatform, telegramDownload } from './platform';
 import './style.css';
 
 const stepNames = ['Материалы', 'Уточнения', 'План', 'Дизайн', 'Результат'];
@@ -189,7 +189,7 @@ function App() {
                   {config?.modes.includes('standard') && <div className="mode-card"><span className="mode-icon">▧</span><h3>Стандартная презентация</h3><p>Слайды-изображения и PDF с художественным оформлением. Дополнительно — простой PPTX для правки текста.</p><button className="primary" onClick={() => void command('generate',{mode:'standard'})}>Создать презентацию →</button></div>}
                   {config?.modes.includes('editable') && <div className="mode-card"><span className="badge experimental">Экспериментальный</span><h3>Редактируемый PowerPoint</h3><p>Текст, фигуры и схемы можно менять в PowerPoint. Фон и иллюстрации остаются изображениями. В комплекте HTML.</p><button className="secondary" onClick={() => void command('generate',{mode:'editable'})}>Создать редактируемую →</button></div>}
                 </div><p className="hint">Новые презентации расходуют доступные запуски. Повтор незавершённого этапа использует сохранённый прогресс.</p></section>}
-                {project.stage === 'complete' && <section className="card form-card"><span className="eyebrow success-text">ГОТОВО К ВАШИМ ПРАВКАМ И ПОКАЗУ</span><h2>Ваша презентация готова</h2><p>Скачайте результат или просмотрите слайды ниже.</p><div className="downloads">{project.files.map(file => <a className="primary" key={file.kind} href={file.url} download>↓ {file.label}</a>)}</div>
+                {project.stage === 'complete' && <section className="card form-card"><span className="eyebrow success-text">ГОТОВО К ВАШИМ ПРАВКАМ И ПОКАЗУ</span><h2>Ваша презентация готова</h2><p>Скачайте результат или просмотрите слайды ниже.</p><Downloads project={project}/>
                   {!!project.previews.length && <div className="slide-previews">{project.previews.map(s => <figure key={s.number}><img src={s.url} alt={`Слайд ${s.number}`} loading="lazy"/><figcaption>Слайд {s.number}</figcaption></figure>)}</div>}
                   {project.html_preview && <div className="html-preview"><iframe title="Предпросмотр презентации" src={project.html_preview} sandbox=""/></div>}
                   {project.text_report && <details><summary>Результат проверки текста</summary><p className="pre-wrap">{project.text_report.replace(/<[^>]*>/g,'')}</p></details>}
@@ -392,6 +392,34 @@ function Plan({project,command,upload}: Props & Upload) {
     </div></article>)}
     <div className="card form-card"><div className="form-actions">{dirty&&<span className="hint" role="status">Несохранённые слайды: {dirtyNumbers.join(', ')}. Нажмите «Сохранить слайд» под каждой изменённой карточкой.</span>}<button className="primary" disabled={dirty||!project.slides.length} onClick={()=>void command('accept_plan')}>План подходит, перейти к дизайну →</button></div></div>
   </section>;
+}
+type DownloadLink = { path: string; file_name: string; at: number };
+// Inside Telegram a click must reach downloadFile/openLink right away, so signed links
+// (valid 5 minutes on the server) are fetched in advance and refreshed after 4 minutes.
+function Downloads({project}: {project: Project}) {
+  const [links, setLinks] = useState<Record<string, DownloadLink>>({});
+  const [error, setError] = useState('');
+  const fetchLinks = useCallback(async () => {
+    const entries = await Promise.all(project.files.map(async file => [file.kind,
+      {...await api<{ path: string; file_name: string }>(`/projects/${project.id}/files/${file.kind}/link`, { method: 'POST' }), at: Date.now()}] as const));
+    setLinks(Object.fromEntries(entries));
+  }, [project.id, project.files.map(f => f.kind).join()]);
+  useEffect(() => {
+    if (!inTelegram() || !project.files.length) return;
+    const load = () => void fetchLinks().catch(() => setError('Не удалось подготовить ссылки на файлы. Обновите страницу.'));
+    load();
+    const timer = window.setInterval(load, 4*60*1000);
+    return () => window.clearInterval(timer);
+  }, [fetchLinks, project.files.length]);
+  return <><div className="downloads">{project.files.map(file => <a className="primary" key={file.kind} href={file.url} download onClick={e => {
+    if (!inTelegram()) return;
+    e.preventDefault();
+    const link = links[file.kind];
+    if (link && Date.now() - link.at < 4*60*1000) { setError(''); telegramDownload(window.location.origin + link.path, link.file_name); }
+    else { setError('Готовим ссылку на файл, нажмите ещё раз через секунду.'); void fetchLinks().catch(() => setError('Не удалось подготовить ссылку на файл.')); }
+  }}>↓ {file.label}</a>)}</div>
+    {inTelegram() && <p className="hint">Файл откроется в окне загрузки Telegram. Его также можно получить в чате с ботом.</p>}
+    {error && <div className="alert error" role="alert">{error}</div>}</>;
 }
 function Background({project,command}: Props) {
   const [comment,setComment] = useState('');

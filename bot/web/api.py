@@ -27,7 +27,7 @@ from bot.plan import plan_slides, parse_slide_edit, replace_slide, missing_data
 from bot.presets import PresetStore
 from bot.questions import QuestionBank
 from bot.user_images import UserImage
-from bot.web.auth import current_user, telegram_user, issue_session, is_loopback
+from bot.web.auth import current_user, telegram_user, issue_session, is_loopback, issue_download, download_claims
 from bot.web.settings import WebSettings
 from bot.web.storage import (Conflict, QuotaExceeded, row, rows, project, latest_job,
                              update_project, enqueue, cancel, result_files)
@@ -502,14 +502,33 @@ def create_app(settings: WebSettings | None = None):
         path = safe_path(value, sid, preset=kind in (BACKGROUND,BACKGROUND_ALT))
         return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0])
 
-    @app.get('/api/v1/projects/{sid}/files/{kind}')
-    async def download(sid: int, kind: str, user=Depends(current_user), db=Depends(database)):
+    async def result_path(db, sid, kind, user):
         p = await owned(db, sid, user)
         outputs = await result_files(db, sid)
         if kind not in outputs or p['status'] != 'completed':
             raise HTTPException(404)
-        path = safe_path(outputs[kind]['path'], sid)
+        return safe_path(outputs[kind]['path'], sid)
+
+    @app.get('/api/v1/projects/{sid}/files/{kind}')
+    async def download(sid: int, kind: str, user=Depends(current_user), db=Depends(database)):
+        path = await result_path(db, sid, kind, user)
         return FileResponse(path, filename='PowerGuide'+path.suffix, content_disposition_type='attachment')
+
+    @app.post('/api/v1/projects/{sid}/files/{kind}/link')
+    async def download_link(sid: int, kind: str, user=Depends(current_user), db=Depends(database)):
+        """Telegram.WebApp.downloadFile: the Telegram app downloads the URL itself, without
+        the session cookie, so it gets a signed link that works for a few minutes."""
+        path = await result_path(db, sid, kind, user)
+        token = issue_download(user['uid'], sid, kind, settings)
+        return {'path': '/api/v1/downloads/'+token, 'file_name': 'PowerGuide'+path.suffix}
+
+    @app.get('/api/v1/downloads/{token}')
+    async def signed_download(token: str, db=Depends(database)):
+        claims = download_claims(token, settings)
+        path = await result_path(db, claims['sid'], claims['kind'], {'uid': claims['uid']})
+        # Headers recommended by Telegram for downloadFile (web clients fetch it cross-origin).
+        return FileResponse(path, filename='PowerGuide'+path.suffix, content_disposition_type='attachment',
+                            headers={'Access-Control-Allow-Origin': 'https://web.telegram.org'})
 
     @app.get('/api/v1/projects/{sid}/preview')
     async def preview(sid: int, user=Depends(current_user), db=Depends(database)):

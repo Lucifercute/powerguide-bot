@@ -194,6 +194,31 @@ class MiniAppTests(unittest.IsolatedAsyncioTestCase):
             r = await self.client.get(file['url']); self.assertEqual(r.status_code,200)
             self.assertIn('attachment',r.headers['content-disposition'])
             self.assertTrue(r.content.startswith(b'%PDF' if file['kind']=='result_pdf' else b'PK'))
+        # Telegram.WebApp.downloadFile: a signed link that works without the session cookie.
+        file = p['files'][0]
+        link = (await self.client.post(file['url']+'/link')).json()
+        self.assertEqual(link['file_name'],'PowerGuide.pdf')
+        cookies = dict(self.client.cookies); self.client.cookies.clear()
+        try:
+            r = await self.client.get(link['path']); self.assertEqual(r.status_code,200)
+            self.assertTrue(r.content.startswith(b'%PDF'))
+            self.assertIn('attachment',r.headers['content-disposition'])
+            self.assertEqual(r.headers['access-control-allow-origin'],'https://web.telegram.org')
+            token = link['path'].rsplit('/',1)[1]
+            payload, signature = token.split('.')
+            for bad in (payload+'.'+'0'*64, payload[:-2]+'.'+signature, 'garbage'):
+                self.assertEqual((await self.client.get('/api/v1/downloads/'+bad)).status_code,404)
+            # The link is not a session, and the session is not a link.
+            self.client.cookies.set('powerguide_session', token, path='/api')
+            self.assertEqual((await self.client.get('/api/v1/me')).status_code,401)
+            self.assertEqual((await self.client.get('/api/v1/downloads/'+cookies['powerguide_session'])).status_code,404)
+        finally:
+            self.client.cookies.clear(); self.client.cookies.update(cookies)
+        from bot.web.auth import issue_download
+        expired = issue_download(self.settings.dev_user_id, p['id'], 'result_pdf', self.app.state.settings, now=time.time()-301)
+        self.assertEqual((await self.client.get('/api/v1/downloads/'+expired)).status_code,404)
+        other = issue_download(999, p['id'], 'result_pdf', self.app.state.settings)
+        self.assertEqual((await self.client.get('/api/v1/downloads/'+other)).status_code,404)
         self.assertEqual(self.pipeline.slide.await_count,2)
         await self.work()  # independent notification job, disabled for local identity
         self.assertEqual(self.pipeline.slide.await_count,2)

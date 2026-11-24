@@ -40,6 +40,35 @@ def is_loopback(request: Request) -> bool:
     )
 
 
+DOWNLOAD_TTL = 300
+
+
+def _download_key(settings) -> bytes:
+    # A separate key: a download link can never pass as a session cookie, and vice versa.
+    return hmac.new(settings.secret.encode(), b'powerguide-download', hashlib.sha256).digest()
+
+
+def issue_download(uid: int, sid: int, kind: str, settings, now: float | None = None) -> str:
+    """Short-lived link for Telegram.WebApp.downloadFile: Telegram fetches it without our cookie."""
+    data = {'uid': uid, 'sid': sid, 'kind': kind, 'exp': int(now if now is not None else time.time()) + DOWNLOAD_TTL}
+    payload = base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip('=')
+    return payload + '.' + hmac.new(_download_key(settings), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def download_claims(token: str, settings, now: float | None = None) -> dict:
+    try:
+        payload, signature = token.split('.')
+        expected = hmac.new(_download_key(settings), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise ValueError()
+        data = json.loads(base64.urlsafe_b64decode(payload + '='*(-len(payload) % 4)))
+        if data['exp'] < (time.time() if now is None else now):
+            raise ValueError()
+        return {'uid': int(data['uid']), 'sid': int(data['sid']), 'kind': str(data['kind'])}
+    except (ValueError, KeyError, TypeError, binascii.Error):
+        raise HTTPException(404, 'Ссылка на файл устарела. Нажмите «Скачать» ещё раз') from None
+
+
 def issue_session(uid, settings, *, dev=False, invitation=None):
     data = {'uid': uid, 'exp': int(time.time())+43200, 'dev': dev}
     if invitation:
