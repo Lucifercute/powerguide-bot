@@ -811,7 +811,7 @@ async def ack(callback: CallbackQuery) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Привет! Я помогу собрать растровую презентацию по методологии PowerGuide.\n"
+        "Привет! Я помогу собрать презентацию по методологии PowerGuide — с редактируемым PowerPoint на выходе.\n"
         "Сначала расскажите о презентации, а я уточню то, чего не хватает.",
         reply_markup=start_keyboard,
     )

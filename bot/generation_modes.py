@@ -27,16 +27,22 @@ CHOICE_TEXT = (
 )
 
 
+def standard_enabled() -> bool:
+    """Standard (raster) generation is off by default since 2026-11-24: new presentations are
+    editable only. The code stays for sessions that already started rendering slides."""
+    return os.getenv('STANDARD_GENERATION_ENABLED', '0') == '1'
+
+
 def choice_keyboard(session_id):
     rows = [[InlineKeyboardButton(text='✏️ Редактируемый PPTX', callback_data=f'genmode:{session_id}:editable')]]
-    if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1':
+    if standard_enabled():
         rows.append([InlineKeyboardButton(text='▶️ Стандартная генерация', callback_data=f'genmode:{session_id}:standard')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def failed_keyboard(session_id):
     rows = [[InlineKeyboardButton(text='Повторить', callback_data='retry_step')]]
-    if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1':
+    if standard_enabled():
         rows.append([InlineKeyboardButton(text='Перейти к стандартной генерации', callback_data=f'genfallback:{session_id}')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -58,14 +64,15 @@ async def continue_generation(message, db, pipeline, files_dir, session_id):
             log.info('Session %d: standard mode, reason=%s', session_id,
                      'existing_render_progress' if old_progress else 'editable_disabled')
             await db.save_artifact(session_id, MODE, mode)
+        elif not standard_enabled():
+            # The only mode: no question, the editable presentation starts right away.
+            mode = 'editable'
+            log.info('Session %d: editable mode (the only one enabled)', session_id)
+            await db.save_artifact(session_id, MODE, mode)
         else:
             await db.set_waiting_for(session_id, WAIT_MODE)
             log.info('Session %d: offering generation mode choice', session_id)
-            text = CHOICE_TEXT if os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1' else (
-                'Подготовить редактируемый PPTX? Текст и элементы схем можно менять в PowerPoint. '
-                'Иллюстрации и фон останутся изображениями. Дополнительно получите HTML.'
-            )
-            await message.answer(text, reply_markup=choice_keyboard(session_id))
+            await message.answer(CHOICE_TEXT, reply_markup=choice_keyboard(session_id))
             return
     await db.set_waiting_for(session_id, None)
     if mode == 'editable':
@@ -114,7 +121,7 @@ async def on_generation_mode(callback, db, pipeline, files_dir):
         return
     if mode not in {'standard', 'editable'}:
         return
-    if mode == 'standard' and os.getenv('STANDARD_GENERATION_ENABLED', '1') != '1':
+    if mode == 'standard' and not standard_enabled():
         await callback.message.answer('Стандартный режим больше не доступен для новых генераций.')
         return
     async with _choices[session_id]:

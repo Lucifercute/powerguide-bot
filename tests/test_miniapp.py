@@ -224,6 +224,44 @@ class MiniAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pipeline.slide.await_count,2)
         self.assertEqual((await self.client.get('/api/v1/me')).json()['used_today'],1)
 
+    async def test_only_editable_mode_starts_generation_with_the_background(self):
+        self.settings.standard_enabled = False
+        self.assertEqual((await self.client.get('/api/v1/config')).json()['modes'],['editable'])
+        p = await self.to_mode()  # accept_background
+        self.assertEqual(p['stage'],'generating'); self.assertTrue(p['busy'])
+        self.assertEqual(p['mode'],'editable')
+        self.assertEqual((await latest_job(self.db,p['id']))['action'],'generate')
+        r = await self.client.post(f'/api/v1/projects/{p["id"]}/commands',json={'revision':p['revision'],'action':'generate','mode':'standard'})
+        self.assertEqual(r.status_code,409)
+
+    async def test_slide_form_fields_and_known_types(self):
+        p = await self.to_plan()
+        self.assertEqual((await self.client.get('/api/v1/config')).json()['slide_types'],
+                         ['титульный','текст','таблица','диаграмма','схема','текст + иллюстрация'])
+        slide = p['slides'][0]
+        self.assertEqual((slide['title'],slide['type'],slide['content']),('Проверка 1','текст','Доход 12,5 млн рублей'))
+        content = 'Форма: этапы\nБлоки: Подготовка; Проверка\nТИП: не поле, а текст'
+        p = await self.command(p,'edit_slide',number=1,title='  Новый   заголовок ',slide_type='схема',content=content)
+        slide = p['slides'][0]
+        self.assertEqual((slide['title'],slide['type'],slide['content']),('Новый заголовок','схема',content))
+        self.assertTrue(slide['text'].startswith('ЗАГОЛОВОК: Новый заголовок\nТИП: схема\nСОДЕРЖАНИЕ:\nФорма'))
+        for values, error in (({'title':'','slide_type':'текст','content':'x'},'заголовок пустой'),
+                              ({'title':'T','slide_type':'инфографика','content':'x'},'выберите тип'),
+                              ({'title':'T','slide_type':'текст','content':'  '},'содержание пустое')):
+            r = await self.client.post(f'/api/v1/projects/{p["id"]}/commands',json={'revision':p['revision'],'action':'edit_slide','number':1,**values})
+            self.assertEqual(r.status_code,422); self.assertIn(error,r.json()['detail'])
+        # A model-written unknown type leaves the select empty and blocks the plan until fixed.
+        from bot.pipeline import PLAN as PLAN_STEP
+        plan = await self.db.get_artifact(p['id'],PLAN_STEP.kind)
+        await self.db.save_artifact(p['id'],PLAN_STEP.kind,plan.replace('ТИП: текст','ТИП: инфографика',1))
+        p = await self.get(p)
+        self.assertEqual(p['slides'][1]['type'],'')
+        r = await self.client.post(f'/api/v1/projects/{p["id"]}/commands',json={'revision':p['revision'],'action':'accept_plan'})
+        self.assertEqual(r.status_code,422); self.assertIn('2',r.json()['detail'])
+        p = await self.command(p,'edit_slide',number=2,title='Проверка 2',slide_type='таблица',content='Доход')
+        p = await self.command(p,'accept_plan')
+        self.assertEqual(p['stage'],'style')
+
     async def test_editable_result_preview_is_sandboxed_and_delivery_is_separate(self):
         async def editable(db,sid,folder,status):
             folder = folder/str(sid); folder.mkdir(parents=True,exist_ok=True)

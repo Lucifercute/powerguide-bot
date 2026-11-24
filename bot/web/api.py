@@ -23,7 +23,7 @@ from bot.pipeline import (
     BACKGROUND_ATTEMPT, BACKGROUND_COMMENT, RATIO_ANSWER_KEY, SKIPPED_ANSWER,
     user_image_kind, slide_kind,
 )
-from bot.plan import plan_slides, parse_slide_edit, replace_slide, missing_data
+from bot.plan import plan_slides, parse_slide_edit, replace_slide, missing_data, slide_fields, compose_slide, SLIDE_TYPES
 from bot.presets import PresetStore
 from bot.questions import QuestionBank
 from bot.user_images import UserImage
@@ -64,6 +64,10 @@ class Command(BaseModel):
     answers: dict[str, str] = Field(default_factory=dict, max_length=50)
     number: int = Field(default=1, ge=1, le=10)
     text: str = Field(default='', max_length=20000)
+    # Slide form (edit_slide): field names are not editable, only their values.
+    title: str | None = Field(default=None, max_length=1000)
+    slide_type: str | None = Field(default=None, max_length=50)
+    content: str | None = Field(default=None, max_length=20000)
     preset: int | None = None
     change: Literal['edit', 'redraw'] = 'redraw'
     choice: Literal['1', '2'] = '1'
@@ -172,7 +176,7 @@ def create_app(settings: WebSettings | None = None):
     async def config(request: Request):
         return {'dev_login': settings.dev_auth and is_loopback(request),
                 'modes': [m for m, enabled in [('standard', settings.standard_enabled), ('editable', settings.editable_enabled)] if enabled],
-                'max_slides': 10, 'daily_limit': settings.daily_limit}
+                'max_slides': 10, 'daily_limit': settings.daily_limit, 'slide_types': list(SLIDE_TYPES)}
 
     @app.post('/api/v1/auth/telegram')
     async def login(body: Login, request: Request):
@@ -247,7 +251,7 @@ def create_app(settings: WebSettings | None = None):
             'answers': await db.get_answers(sid), 'questions': [{'key': q.key, 'text': q.text} for q in QuestionBank(settings.questions_path).load().questions],
             'sources': [{'position': f.position, 'name': f.name, 'comment': f.comment} for f in sources],
             'sources_confirmed': a.get(SOURCES_CONFIRMED) == str(len(sources)),
-            'slides': [{'number': n, 'text': text, 'missing': missing.get(n, []),
+            'slides': [{'number': n, 'text': text, **vars(slide_fields(text)), 'missing': missing.get(n, []),
                         'image': root+f'/assets/{user_image_kind(n)}' if user_image_kind(n) in a else None,
                         'caption': UserImage.from_json(a[user_image_kind(n)]).caption if user_image_kind(n) in a else ''} for n, text in slides.items()],
             'notes': general, 'job': {k: job[k] for k in ('id','action','status','progress','error')} if job else None,
@@ -317,6 +321,16 @@ def create_app(settings: WebSettings | None = None):
                     raise Conflict('Сначала продолжите прерванный шаг')
                 async def queue(name):
                     await enqueue(db, sid, name, settings.daily_limit)
+
+                async def background_accepted():
+                    # With one enabled mode there is nothing to choose: generation starts now.
+                    modes = [m for m, on in (('editable', settings.editable_enabled), ('standard', settings.standard_enabled)) if on]
+                    if len(modes) == 1:
+                        await db.save_artifact(sid, 'generation_mode', modes[0], 'user')
+                        await queue('generate')
+                        await update_project(db, sid, stage='generating', waiting_for=None)
+                    else:
+                        await update_project(db, sid, stage='mode', waiting_for='generation_mode')
                 if action in ('save_sources','analyze') and stage == 'sources':
                     if not body.description.strip():
                         raise ValueError('Опишите, о чём будет презентация')
@@ -360,11 +374,17 @@ def create_app(settings: WebSettings | None = None):
                 elif action == 'edit_slide' and stage == 'plan':
                     if body.number not in plan_slides(a[PLAN.kind]):
                         raise ValueError('Слайд не найден')
-                    text = parse_slide_edit(body.text, body.number)
+                    if body.title is not None or body.slide_type is not None or body.content is not None:
+                        text = compose_slide(body.title or '', body.slide_type or '', body.content or '', body.number)
+                    else:
+                        text = parse_slide_edit(body.text, body.number)
                     await db.save_artifact(sid, PLAN.kind, replace_slide(a[PLAN.kind], body.number, text), 'user')
                 elif action == 'delete_image' and stage == 'plan':
                     await db.delete_artifact(sid, user_image_kind(body.number))
                 elif action == 'accept_plan' and stage == 'plan':
+                    untyped = [n for n, text in plan_slides(a[PLAN.kind]).items() if not slide_fields(text).type]
+                    if untyped:
+                        raise ValueError('Выберите тип для слайдов: ' + ', '.join(map(str, untyped)))
                     await db.save_artifact(sid, 'slide_images_done', '', 'user')
                     await update_project(db, sid, stage='style', waiting_for='style_ref')
                 elif action == 'select_style' and stage == 'style':
@@ -376,7 +396,7 @@ def create_app(settings: WebSettings | None = None):
                         await db.save_artifact(sid, STYLE, preset.style, 'preset')
                         await db.save_artifact(sid, BACKGROUND, str(preset.background), 'preset')
                         await db.save_artifact(sid, BACKGROUND_ACCEPTED, '', 'user')
-                        await update_project(db, sid, stage='mode', waiting_for='generation_mode')
+                        await background_accepted()
                     else:
                         if STYLE_REF not in a:
                             await db.save_artifact(sid, STYLE_REF, '', 'user')
@@ -393,7 +413,7 @@ def create_app(settings: WebSettings | None = None):
                     await db.save_artifact(sid, BACKGROUND_CHOICE, body.choice, 'user')
                     await db.save_artifact(sid, BACKGROUND_ACCEPTED, '', 'user')
                     await db.conn.execute("UPDATE presentation_jobs SET status='superseded' WHERE session_id=? AND action='background_change' AND status IN ('failed','interrupted')", (sid,))
-                    await update_project(db, sid, stage='mode', waiting_for='generation_mode')
+                    await background_accepted()
                 elif action == 'generate' and (stage == 'mode' or (failed and job['action']=='generate' and a.get('generation_mode')=='editable' and body.mode=='standard')):
                     if (body.mode == 'editable' and not settings.editable_enabled) or (body.mode == 'standard' and not settings.standard_enabled):
                         raise ValueError('Этот режим отключён')

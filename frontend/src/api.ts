@@ -3,14 +3,14 @@ export type Project = Summary & {
   revision: number; stage: string; description: string;
   answers: Record<string, string>; questions: { key: string; text: string }[];
   sources: { position: number; name: string; comment: string }[]; sources_confirmed: boolean; notes: string[];
-  slides: { number: number; text: string; missing: string[]; image: string | null; caption: string | null }[];
+  slides: { number: number; text: string; title: string; type: string; content: string; missing: string[]; image: string | null; caption: string | null }[];
   job: { id: number; action: string; status: string; progress: string; error: string | null } | null;
   busy: boolean; actions: string[]; backgrounds: { choice: string; url: string }[];
   can_change_background: boolean; reference: string | null; mode: string | null;
   files: { kind: string; label: string; url: string }[];
   previews: { number: number; url: string }[]; html_preview: string | null; text_report: string;
 };
-export type Config = { dev_login: boolean; modes: string[]; max_slides: number; daily_limit: number };
+export type Config = { dev_login: boolean; modes: string[]; max_slides: number; daily_limit: number; slide_types: string[] };
 export type Me = { user_id: number; is_dev: boolean; is_guest?: boolean; name?: string; used_today: number; daily_limit: number };
 export type Preset = { number: number; preview: string };
 export class ApiError extends Error {

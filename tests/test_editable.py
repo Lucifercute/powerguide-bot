@@ -55,10 +55,26 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
         await self.db.save_artifact(self.sid, BACKGROUND_ACCEPTED, '')
         self.message = AsyncMock()
         self.pipeline = SimpleNamespace(editable_enabled=True, editable_service=SimpleNamespace(generate=AsyncMock()))
+        # The choice between modes exists only with standard generation turned on (off by default).
+        env = patch.dict('os.environ', {'STANDARD_GENERATION_ENABLED': '1'})
+        env.start()
+        self.addCleanup(env.stop)
 
     async def asyncTearDown(self):
         await self.db.close()
         self.tmp.cleanup()
+
+    async def test_default_is_editable_without_a_question(self):
+        with patch.dict('os.environ', {'STANDARD_GENERATION_ENABLED': '0'}), \
+                patch.object(modes, 'run_editable', AsyncMock()) as editable, \
+                patch.object(modes, 'run_slides', AsyncMock()) as old:
+            await modes.continue_generation(self.message, self.db, self.pipeline, self.root, self.sid)
+            editable.assert_awaited_once()
+            old.assert_not_awaited()
+            self.message.answer.assert_not_awaited()  # no mode question
+            self.assertEqual(await self.db.get_artifact(self.sid, modes.MODE), 'editable')
+            self.assertIsNone(await self.db.get_waiting_for(self.sid))
+            self.assertEqual(modes.failed_keyboard(self.sid).inline_keyboard[1:], [])  # no standard fallback
 
     def callback(self, data):
         return SimpleNamespace(data=data, from_user=SimpleNamespace(id=42), answer=AsyncMock(), message=self.message)

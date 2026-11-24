@@ -25,3 +25,17 @@ class PlanEditTests(unittest.TestCase):
         for text in cases:
             with self.subTest(text=text), self.assertRaises(SlideFormatError):
                 parse_slide_edit(text, 1)
+
+
+class SlideFormTests(unittest.TestCase):
+    def test_fields_round_trip_and_unsplittable_slide(self):
+        from bot.plan import compose_slide, slide_fields
+        text = compose_slide("Заголовок\nв две строки", "текст + иллюстрация", "- пункт 1\n- пункт 2", 3)
+        self.assertEqual(text, "ЗАГОЛОВОК: Заголовок в две строки\nТИП: текст + иллюстрация\nСОДЕРЖАНИЕ:\n- пункт 1\n- пункт 2")
+        fields = slide_fields(text)
+        self.assertEqual((fields.title, fields.type, fields.content),
+                         ("Заголовок в две строки", "текст + иллюстрация", "- пункт 1\n- пункт 2"))
+        self.assertEqual(slide_fields("**ЗАГОЛОВОК:** Итоги\n**ТИП:** Текст+иллюстрация.\n**СОДЕРЖАНИЕ:** Факты").type,
+                         "текст + иллюстрация")
+        broken = slide_fields("Просто текст без полей")
+        self.assertEqual((broken.title, broken.type, broken.content), ("", "", "Просто текст без полей"))

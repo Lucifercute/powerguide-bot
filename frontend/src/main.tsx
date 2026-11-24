@@ -158,7 +158,7 @@ function App() {
           <section className="page-heading"><div><span className="eyebrow">ИДЕЯ → ПЛАН → СЛАЙДЫ</span><h1>Мои презентации</h1><p>Здесь начинается ваша следующая история.</p></div><button className="primary" disabled={working} onClick={() => void create()}>＋ Новая презентация</button></section>
           {active && <button className="active-banner" onClick={() => void open(active.id)}><span className="active-symbol">◷</span><span><small>ПРОДОЛЖИТЬ РАБОТУ</small><strong>{active.title}</strong></span><span>Открыть →</span></button>}
           <div className="section-label"><h2>Все презентации</h2><span>{projects.length}</span></div>
-          {!projects.length ? <section className="card empty"><div className="empty-icon">▤</div><h2>Пока чистый лист</h2><p>Расскажите, что хотите донести до аудитории.<br/>Поможем собрать это в презентацию.</p><button className="secondary" onClick={() => void create()}>Создать первую презентацию →</button><div className="feature-row"><span>До 10 слайдов</span><span>Ваши материалы</span><span>PDF и PowerPoint</span></div></section> :
+          {!projects.length ? <section className="card empty"><div className="empty-icon">▤</div><h2>Пока чистый лист</h2><p>Расскажите, что хотите донести до аудитории.<br/>Поможем собрать это в презентацию.</p><button className="secondary" onClick={() => void create()}>Создать первую презентацию →</button><div className="feature-row"><span>До 10 слайдов</span><span>Ваши материалы</span><span>Редактируемый PowerPoint</span></div></section> :
             <div className="project-grid">{projects.map(p => <button className="card project-card" key={p.id} onClick={() => void open(p.id)}>
               <div className={'project-cover cover-'+p.status}><span>POWERGUIDE</span><strong>{p.title}</strong><span className="cover-arrow">↗</span></div>
               <div className="project-info"><span className={'badge '+p.status}>{statusLabel(p.status)}</span><small>{new Date(p.created_at.replace(' ', 'T')+'Z').toLocaleDateString('ru-RU')}</small></div><h3>{p.title}</h3><p>{p.origin === 'chat' ? 'Создана в чате' : 'Создана в приложении'} <span>→</span></p>
@@ -177,7 +177,7 @@ function App() {
               {project.origin === 'chat' && project.status === 'in_progress' ? <section className="card empty"><h2>Продолжите в чате бота</h2><p>Эта презентация начата в Telegram-чате. Здесь появятся её готовые результаты.</p><button className="secondary" onClick={() => void create()}>Создать новую в приложении</button></section> : <>
                 {project.stage === 'sources' && <Sources key={project.id} project={project} command={command} upload={upload}/>}
                 {project.stage === 'survey' && <Survey key={project.id+':survey'} project={project} command={command} maxSlides={config?.max_slides ?? 10}/>}
-                {project.stage === 'plan' && <Plan project={project} command={command} upload={upload}/>}
+                {project.stage === 'plan' && <Plan project={project} command={command} upload={upload} slideTypes={config?.slide_types ?? []}/>}
                 {project.stage === 'style' && <section className="card form-card"><span className="eyebrow">ШАГ 4 / ДИЗАЙН</span><h2>Выберите настроение</h2><p>Готовый стиль задаст оформление всех слайдов. Или загрузите свой референс.</p>
                   <div className="preset-grid">{presets.map(p => <button key={p.number} className="preset" onClick={() => void command('select_style',{preset:p.number})}><img src={p.preview} alt={`Пример оформления стиля ${p.number}`}/><span>Стиль {p.number} →</span></button>)}</div>
                   <label className="upload-box">＋ Загрузить референс <small>JPG, PNG или WebP, до 10 МБ</small><input type="file" accept="image/jpeg,image/png,image/webp" onChange={e => { void upload('reference',e.currentTarget.files); e.currentTarget.value=''; }}/></label>
@@ -362,35 +362,58 @@ function Survey({project,command,maxSlides}: Props & {maxSlides: number}) {
     <div className="form-actions"><button className="primary" disabled={needsOther && !other.trim()} onClick={confirm}>Подтвердить и подготовить план →</button></div>
   </section>;
 }
-function Plan({project,command,upload}: Props & Upload) {
-  const [texts,setTexts] = useState<Record<number,string>>({});
+type SlideDraft = { title: string; type: string; content: string };
+const sameSlide = (draft: SlideDraft, slide: Project['slides'][number]) =>
+  draft.title === slide.title && draft.type === slide.type && draft.content === slide.content;
+
+function Plan({project,command,upload,slideTypes}: Props & Upload & {slideTypes: string[]}) {
+  const [drafts,setDrafts] = useState<Record<number,SlideDraft>>({});
   const [captions,setCaptions] = useState<Record<number,string>>({});
   const [saveErrors,setSaveErrors] = useState<Record<number,string>>({});
-  const dirtyNumbers = project.slides.filter(s => texts[s.number] !== undefined && texts[s.number] !== s.text).map(s => s.number);
+  const dirtyNumbers = project.slides.filter(s => drafts[s.number] && !sameSlide(drafts[s.number], s)).map(s => s.number);
   const dirty = dirtyNumbers.length > 0;
   const discard = (number: number) => {
-    setTexts(current => { const next = {...current}; delete next[number]; return next; });
+    setDrafts(current => { const next = {...current}; delete next[number]; return next; });
     setSaveErrors(current => ({...current,[number]:''}));
   };
+  const change = (slide: Project['slides'][number], field: keyof SlideDraft, value: string) => {
+    setDrafts(current => ({...current, [slide.number]: {...(current[slide.number] ?? {title: slide.title, type: slide.type, content: slide.content}), [field]: value}}));
+    setSaveErrors(current => ({...current,[slide.number]:''}));
+  };
   const save = async (number: number) => {
+    const draft = drafts[number];
     setSaveErrors(current => ({...current,[number]:''}));
-    const result = await command('edit_slide',{number,text:texts[number]});
+    const result = await command('edit_slide',{number,title:draft.title,slide_type:draft.type,content:draft.content});
     if (result.project) {
-      // The server trims whitespace and optional headers. Compare against its
-      // canonical text after saving, without clearing drafts of other slides.
+      // The server normalizes spaces. Compare against its fields after saving,
+      // without clearing drafts of other slides.
       discard(number);
     } else if (result.error) {
       setSaveErrors(current => ({...current,[number]:result.error!}));
     }
   };
-  return <section className="plan-editor"><div className="card form-card"><span className="eyebrow">ШАГ 3 / СТРУКТУРА</span><h2>Сначала — правильная история</h2><p>Проверьте содержание каждого слайда. Измените текст и добавьте изображения, которые нужно использовать.</p>{project.notes.map((n,i)=><p className="note" key={i}>{n}</p>)}</div>
-    {project.slides.map(s=><article className="card slide-editor" key={s.number}><div className="slide-number">{String(s.number).padStart(2,'0')}<small>СЛАЙД</small></div><div className="slide-body"><textarea aria-label={`Содержание слайда ${s.number}`} aria-invalid={!!saveErrors[s.number]} aria-describedby={saveErrors[s.number]?`slide-error-${s.number}`:undefined} rows={7} maxLength={20000} value={texts[s.number]??s.text} onChange={e=>{setTexts({...texts,[s.number]:e.target.value});setSaveErrors(current=>({...current,[s.number]:''}));}}/>{s.missing.map((n,i)=><p className="note" key={i}>Не хватает данных: {n}</p>)}
-      {texts[s.number]!==undefined && texts[s.number]!==s.text && <div className="form-actions"><button className="secondary" onClick={()=>void save(s.number)}>Сохранить слайд</button><button className="text-button" onClick={()=>discard(s.number)}>Отменить правки</button></div>}
-      {saveErrors[s.number] && <div className="alert error" id={`slide-error-${s.number}`} role="alert">{saveErrors[s.number]}</div>}
-      {s.image && <div className="attached-image"><img src={s.image} alt={`Ваше изображение для слайда ${s.number}`}/><span>{s.caption||'Без подписи'}</span><button className="text-button danger" onClick={()=>void command('delete_image',{number:s.number})}>Убрать</button></div>}
-      <div className="slide-photo-form"><label>Подпись к новому изображению<input maxLength={100} value={captions[s.number]||''} onChange={e=>setCaptions({...captions,[s.number]:e.target.value})} placeholder="Необязательно, до 100 символов"/></label><label className="upload-link">＋ {s.image?'Заменить':'Добавить'} изображение<input type="file" accept="image/jpeg,image/png,image/webp" onChange={e=>{void upload('slide',e.currentTarget.files,s.number,captions[s.number]);e.currentTarget.value='';}}/></label></div>
-    </div></article>)}
-    <div className="card form-card"><div className="form-actions">{dirty&&<span className="hint" role="status">Несохранённые слайды: {dirtyNumbers.join(', ')}. Нажмите «Сохранить слайд» под каждой изменённой карточкой.</span>}<button className="primary" disabled={dirty||!project.slides.length} onClick={()=>void command('accept_plan')}>План подходит, перейти к дизайну →</button></div></div>
+  return <section className="plan-editor"><div className="card form-card"><span className="eyebrow">ШАГ 3 / СТРУКТУРА</span><h2>Сначала — правильная история</h2><p>Проверьте каждый слайд: заголовок, тип и содержание. Добавьте изображения, которые нужно использовать.</p>{project.notes.map((n,i)=><p className="note" key={i}>{n}</p>)}</div>
+    {project.slides.map(s=>{
+      const draft = drafts[s.number] ?? {title: s.title, type: s.type, content: s.content};
+      const changed = !!drafts[s.number] && !sameSlide(drafts[s.number], s);
+      const error = saveErrors[s.number];
+      const describedBy = error ? `slide-error-${s.number}` : undefined;
+      return <article className="card slide-editor" key={s.number}><div className="slide-number">{String(s.number).padStart(2,'0')}<small>СЛАЙД</small></div><div className="slide-body">
+        <label>Заголовок<input aria-label={`Заголовок слайда ${s.number}`} aria-invalid={!!error} aria-describedby={describedBy} maxLength={1000} value={draft.title} onChange={e=>change(s,'title',e.target.value)}/></label>
+        <label>Тип слайда<select aria-label={`Тип слайда ${s.number}`} aria-invalid={!!error} aria-describedby={describedBy} value={draft.type} onChange={e=>change(s,'type',e.target.value)}>
+          {!draft.type && <option value="">— выберите тип —</option>}
+          {slideTypes.map(type => <option key={type} value={type}>{type}</option>)}
+        </select></label>
+        <label>Содержание<textarea aria-label={`Содержание слайда ${s.number}`} aria-invalid={!!error} aria-describedby={describedBy} rows={7} maxLength={20000} value={draft.content} onChange={e=>change(s,'content',e.target.value)}/></label>
+        {s.missing.map((n,i)=><p className="note" key={i}>Не хватает данных: {n}</p>)}
+        {changed && <div className="form-actions"><button className="secondary" disabled={!draft.title.trim() || !draft.type || !draft.content.trim()} onClick={()=>void save(s.number)}>Сохранить слайд</button><button className="text-button" onClick={()=>discard(s.number)}>Отменить правки</button></div>}
+        {error && <div className="alert error" id={`slide-error-${s.number}`} role="alert">{error}</div>}
+        {s.image && <div className="attached-image"><img src={s.image} alt={`Ваше изображение для слайда ${s.number}`}/><span>{s.caption||'Без подписи'}</span><button className="text-button danger" onClick={()=>void command('delete_image',{number:s.number})}>Убрать</button></div>}
+        <div className="slide-photo-form"><label>Подпись к новому изображению<input maxLength={100} value={captions[s.number]||''} onChange={e=>setCaptions({...captions,[s.number]:e.target.value})} placeholder="Необязательно, до 100 символов"/></label><label className="upload-link">＋ {s.image?'Заменить':'Добавить'} изображение<input type="file" accept="image/jpeg,image/png,image/webp" onChange={e=>{void upload('slide',e.currentTarget.files,s.number,captions[s.number]);e.currentTarget.value='';}}/></label></div>
+      </div></article>;
+    })}
+    <div className="card form-card"><div className="form-actions">{dirty&&<span className="hint" role="status">Несохранённые слайды: {dirtyNumbers.join(', ')}. Нажмите «Сохранить слайд» под каждой изменённой карточкой.</span>}<button className="primary" disabled={dirty||!project.slides.length||project.slides.some(s=>!s.type)} onClick={()=>void command('accept_plan')}>План подходит, перейти к дизайну →</button></div>
+      {project.slides.some(s=>!s.type) && <p className="hint">Выберите тип для слайдов: {project.slides.filter(s=>!s.type).map(s=>s.number).join(', ')}.</p>}</div>
   </section>;
 }
 type DownloadLink = { path: string; file_name: string; at: number };

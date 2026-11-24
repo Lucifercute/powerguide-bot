@@ -26,11 +26,22 @@ if __name__ == '__main__':
         root = Path(folder)
         settings = WebSettings(db_path=root/'test.db', files_dir=root/'sessions',
                                presets_dir=root/'presets', dev_auth=True, secret='browser-test-secret-xxxxxxxxxxxxxxxx',
-                               editable_enabled=True, invites_enabled=True)
+                               editable_enabled=True, standard_enabled=False, invites_enabled=True)
         sys.path.insert(0,str(ROOT/'tests'))
         from test_miniapp import fake_pipeline
         raw=io.BytesIO();PILImage.new('RGB',(320,180),'white').save(raw,format='PNG')
         pipeline=fake_pipeline(Image(raw.getvalue(),'image/png'))
+
+        async def editable(db,sid,folder,status):
+            # Deterministic stand-in for the editable PPTX service (same mode as production).
+            await status('Собираю PowerPoint и проверяю вёрстку…')
+            folder=folder/str(sid)/'editable';folder.mkdir(parents=True,exist_ok=True)
+            html=folder/'presentation.html';pptx=folder/'presentation.pptx'
+            html.write_text('<html><body><section class="slide">ТЕСТ</section></body></html>')
+            pptx.write_bytes(b'PK\x03\x04 TEST')
+            await db.save_artifact(sid,'editable_html',str(html));await db.save_artifact(sid,'editable_pptx',str(pptx))
+            return html,pptx
+        pipeline.editable_service.generate.side_effect=editable
         app=create_app(settings)
         original_lifespan=app.router.lifespan_context
 

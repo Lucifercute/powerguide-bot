@@ -107,6 +107,43 @@ def _slide_type(raw: str) -> str:
     return " ".join(raw.lower().replace("+", " + ").split()).strip(".")
 
 
+@dataclass
+class SlideFields:
+    title: str
+    type: str  # one of SLIDE_TYPES, or "" when the model wrote an unknown type
+    content: str
+
+
+def slide_fields(text: str) -> SlideFields:
+    """Slide text split for the form: the field names stay out of the user's reach."""
+    fields: dict[str, re.Match] = {}
+    for match in _FIELD.finditer(text):
+        fields.setdefault(match.group(1).upper(), match)
+    if not all(name in fields for name in FIELDS) or not (
+        fields["ЗАГОЛОВОК"].start() < fields["ТИП"].start() < fields["СОДЕРЖАНИЕ"].start()
+    ):
+        # A slide the parser cannot split: everything goes to the content, the user fills the rest.
+        return SlideFields("", "", text.strip())
+    title = text[fields["ЗАГОЛОВОК"].start(2) : fields["ТИП"].start()].strip()
+    kind = _slide_type(fields["ТИП"].group(2))
+    return SlideFields(" ".join(title.split()), kind if kind in SLIDE_TYPES else "",
+                       text[fields["СОДЕРЖАНИЕ"].start(2) :].strip())
+
+
+def compose_slide(title: str, kind: str, content: str, number: int) -> str:
+    """Slide text from the form fields, checked like a hand-edited slide."""
+    title = " ".join(title.split())
+    content = content.strip()
+    if not title:
+        raise SlideFormatError("заголовок пустой.")
+    if kind not in SLIDE_TYPES:
+        raise SlideFormatError("выберите тип слайда из списка.")
+    if not content:
+        raise SlideFormatError("содержание пустое.")
+    body = f"\n{content}" if "\n" in content else f" {content}"
+    return parse_slide_edit(f"ЗАГОЛОВОК: {title}\nТИП: {kind}\nСОДЕРЖАНИЕ:{body}", number)
+
+
 def parse_slide_edit(text: str, number: int) -> str:
     """The user's edited slide N, checked: ЗАГОЛОВОК, ТИП and СОДЕРЖАНИЕ in this order, a known
     type and nonempty content. Schemes may use ordinary prose: visual structure is

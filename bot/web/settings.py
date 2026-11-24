@@ -34,7 +34,7 @@ class WebSettings:
             secret = secrets.token_hex(32)
         if len(secret) < 32:
             raise RuntimeError('Задайте WEB_SESSION_SECRET длиной не менее 32 символов')
-        if os.getenv('STANDARD_GENERATION_ENABLED', '1') != '1' and os.getenv('EDITABLE_PPTX_ENABLED', '0') != '1':
+        if os.getenv('STANDARD_GENERATION_ENABLED', '0') != '1' and os.getenv('EDITABLE_PPTX_ENABLED', '0') != '1':
             raise RuntimeError('Включите хотя бы один режим генерации')
         return cls(
             db_path=Path(os.getenv('DB_PATH', 'data/bot.db')),
@@ -48,6 +48,6 @@ class WebSettings:
             daily_limit=max(1, int(os.getenv('PILOT_DAILY_LIMIT', '3'))),
             concurrency=max(1, min(3, int(os.getenv('PILOT_CONCURRENCY', '3')))),
             editable_enabled=os.getenv('EDITABLE_PPTX_ENABLED', '0') == '1',
-            standard_enabled=os.getenv('STANDARD_GENERATION_ENABLED', '1') == '1',
+            standard_enabled=os.getenv('STANDARD_GENERATION_ENABLED', '0') == '1',
             miniapp_url=os.getenv('MINIAPP_URL', ''),
         )
